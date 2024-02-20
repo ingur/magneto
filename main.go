@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/md5"
 	"embed"
 	"encoding/json"
 	"flag"
@@ -49,24 +50,24 @@ type Session struct {
 	file string
 }
 
+type TorrentInfo struct {
+	Name string
+	Url  string
+	Time time.Time
+	file *torrent.File
+}
+
 type Server struct {
 	mu       sync.Mutex
 	srv      *http.Server
 	stopChan chan os.Signal
 	client   *torrent.Client
-	torrents map[string]*torrent.File
+	torrents map[string]*TorrentInfo
 }
 
 type Response struct {
-	Message string      `json:"message"`
-	Data    interface{} `json:"data,omitempty"`
-}
-
-// TODO: complete this
-type TorrentInfo struct {
-	Name     string
-	Date     string
-	Progress int
+	Message string   `json:"message"`
+	Urls    []string `json:"urls,omitempty"`
 }
 
 func expect(err error, msg string) {
@@ -181,7 +182,7 @@ func createServer() *Server {
 	server := Server{
 		srv:      &http.Server{Addr: ":" + fmt.Sprint(port)},
 		stopChan: make(chan os.Signal, 1),
-		torrents: make(map[string]*torrent.File),
+		torrents: make(map[string]*TorrentInfo),
 	}
 
 	os.RemoveAll(config.Path)
@@ -199,14 +200,15 @@ func createServer() *Server {
 	server.client = client
 
 	// setup routes
+	// TODO: restructure
 	http.HandleFunc("/tori", server.ping)
 	http.HandleFunc("/stop", server.stop)
 	http.HandleFunc("/play", server.play)
 
 	http.HandleFunc("/stream", server.stream)
 
-	http.HandleFunc("/", server.dashboard)
-	http.HandleFunc("/torrents", server.torrentinfo)
+	// http.HandleFunc("/", server.dashboard)
+	// http.HandleFunc("/torrents", server.torrentinfo)
 
 	return &server
 }
@@ -245,13 +247,36 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	s.stopChan <- os.Interrupt
 }
 
-func (s *Server) addTorrent(uri string) (*torrent.Torrent, error) {
-	if strings.HasPrefix(uri, "magnet:") {
-		return server.client.AddMagnet(uri)
-	} else if strings.HasSuffix(uri, ".torrent") {
-		return server.client.AddTorrentFromFile(uri)
+func (s *Server) getKey(f *torrent.File) string {
+	id := f.Torrent().InfoHash().String() + f.DisplayPath()
+	return fmt.Sprintf("%x", md5.Sum([]byte(id)))
+}
+
+func (s *Server) getUrl(key string) string {
+	return fmt.Sprintf("%s/stream?f=%s", session.Url, key)
+}
+
+func (s *Server) addTorrent(f *torrent.File) *TorrentInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := s.getKey(f)
+
+	info := TorrentInfo{
+		Name: f.DisplayPath(),
+		Url:  s.getUrl(key),
+		Time: time.Now(),
+		file: f,
 	}
-	return nil, fmt.Errorf("Invalid URI")
+
+	s.torrents[key] = &info
+	return &info
+}
+
+func (s *Server) removeTorrent(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.torrents, key)
 }
 
 func (s *Server) torrentExists(t *torrent.Torrent) (bool, []string) {
@@ -259,8 +284,8 @@ func (s *Server) torrentExists(t *torrent.Torrent) (bool, []string) {
 	defer s.mu.Unlock()
 	urls := make([]string, 0)
 	for _, f := range t.Files() {
-		if _, exists := s.torrents[f.DisplayPath()]; exists {
-			urls = append(urls, s.getUrl(f.DisplayPath()))
+		if info, exists := s.torrents[s.getKey(f)]; exists {
+			urls = append(urls, info.Url)
 		}
 	}
 	return len(urls) > 0, urls
@@ -271,10 +296,6 @@ func (s *Server) isValidFile(f *torrent.File) bool {
 	return slices.Contains(config.Filetypes, ext)
 }
 
-func (s *Server) getUrl(name string) string {
-	return fmt.Sprintf("%s/stream?f=%s", session.Url, name)
-}
-
 func (s *Server) play(w http.ResponseWriter, r *http.Request) {
 	uri := r.URL.Query().Get("uri")
 	if uri == "" {
@@ -282,9 +303,14 @@ func (s *Server) play(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t, err := s.addTorrent(uri)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	var t *torrent.Torrent
+	switch {
+	case strings.HasPrefix(uri, "magnet:"):
+		t, _ = s.client.AddMagnet(uri)
+	case strings.HasSuffix(uri, ".torrent"):
+		t, _ = s.client.AddTorrentFromFile(uri)
+	default:
+		http.Error(w, "Unsupported URI format", http.StatusBadRequest)
 		return
 	}
 
@@ -293,7 +319,7 @@ func (s *Server) play(w http.ResponseWriter, r *http.Request) {
 	<-t.GotInfo()
 
 	if exists, urls := s.torrentExists(t); exists {
-		s.respond(w, Response{Message: "Torrent already added", Data: urls})
+		s.respond(w, Response{Message: "Torrent already added", Urls: urls})
 		return
 	}
 
@@ -301,11 +327,8 @@ func (s *Server) play(w http.ResponseWriter, r *http.Request) {
 	anyValid := false
 	for _, f := range t.Files() {
 		if s.isValidFile(f) {
-			s.mu.Lock()
-			s.torrents[f.DisplayPath()] = f
-			s.mu.Unlock()
-
-			urls = append(urls, s.getUrl(f.DisplayPath()))
+			info := s.addTorrent(f)
+			urls = append(urls, info.Url)
 			anyValid = true
 
 			// download first and last pieces first to start streaming asap (in theory)
@@ -318,30 +341,32 @@ func (s *Server) play(w http.ResponseWriter, r *http.Request) {
 
 	if !anyValid {
 		t.Drop()
-		http.Error(w, "No valid files found", http.StatusBadRequest)
+		http.Error(w, "No valid files", http.StatusBadRequest)
 	} else {
-		s.respond(w, Response{Message: "Torrent added", Data: urls})
+		s.respond(w, Response{Message: "Torrent added", Urls: urls})
 		fmt.Printf("Torrent added: %s\n", urls)
 	}
 }
 
 func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
-	fn := r.URL.Query().Get("f")
-	fn = strings.TrimSpace(fn)
-	fn = strings.ReplaceAll(fn, "\n", "")
+	key := r.URL.Query().Get("f")
+	key = strings.TrimSpace(key)
+	key = strings.ReplaceAll(key, "\n", "")
 
-	f, ok := s.torrents[fn]
+	t, ok := s.torrents[key]
 	if !ok {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
 
+	fn := t.file.DisplayPath()
+
 	w.Header().Set("Expires", "0")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")
 	w.Header().Set("Content-Disposition", "attachment; filename="+fn)
 
-	reader := f.NewReader()
-	reader.SetReadahead(f.Length() / 100)
+	reader := t.file.NewReader()
+	reader.SetReadahead(t.file.Length() / 100)
 	reader.SetResponsive()
 
 	http.ServeContent(w, r, fn, time.Now(), reader)
@@ -355,26 +380,26 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 // TODO: rename/restructure this
-func (s *Server) torrentinfo(w http.ResponseWriter, r *http.Request) {
-	t, err := template.ParseFiles("web/torrents.html")
-	expect(err, "Failed to parse template")
-
-	res := make([]TorrentInfo, 0)
-	for _, f := range s.torrents {
-		info := TorrentInfo{}
-		info.Name = f.DisplayPath()
-		info.Date = "today"
-		info.Progress = int(f.BytesCompleted() * 100 / f.Length())
-		res = append(res, info)
-	}
-
-	log.Printf("Torrents: %v\n", res)
-
-	err = t.Execute(w, res)
-	if err != nil {
-		log.Printf("Error executing template: %v", err)
-	}
-}
+// func (s *Server) torrentinfo(w http.ResponseWriter, r *http.Request) {
+// 	t, err := template.ParseFiles("web/torrents.html")
+// 	expect(err, "Failed to parse template")
+//
+// 	res := make([]TorrentInfo, 0)
+// 	for _, f := range s.torrents {
+// 		info := TorrentInfo{}
+// 		info.Name = f.DisplayPath()
+// 		info.Date = "today"
+// 		info.Progress = int(f.BytesCompleted() * 100 / f.Length())
+// 		res = append(res, info)
+// 	}
+//
+// 	log.Printf("Torrents: %v\n", res)
+//
+// 	err = t.Execute(w, res)
+// 	if err != nil {
+// 		log.Printf("Error executing template: %v", err)
+// 	}
+// }
 
 // Main Methods
 
@@ -453,7 +478,7 @@ func play(uri string) {
 			log.Printf("Error decoding response: %v\n", err)
 		}
 
-		args := append(config.Playback[1:], res.Data.([]string)...)
+		args := append(config.Playback[1:], res.Urls...)
 		cmd := exec.Command(config.Playback[0], args...)
 		expect(cmd.Start(), "Failed to start playback")
 
