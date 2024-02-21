@@ -50,6 +50,7 @@ type Session struct {
 	file string
 }
 
+// TODO: maybe url only the /stream?f=key and not include localhost
 type TorrentInfo struct {
 	Name string
 	Url  string
@@ -153,7 +154,7 @@ func (s *Session) exists() bool {
 		return false
 	}
 
-	resp, err := http.Get(s.Url + "/tori")
+	resp, err := http.Get(s.Url + "/magneto")
 	if err != nil {
 		log.Printf("Error pinging server: %v\n", err)
 		return false
@@ -201,7 +202,7 @@ func createServer() *Server {
 
 	// setup routes
 	// TODO: restructure
-	http.HandleFunc("/tori", server.ping)
+	http.HandleFunc("/magneto", server.ping)
 	http.HandleFunc("/stop", server.stop)
 	http.HandleFunc("/play", server.play)
 
