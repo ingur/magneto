@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/md5"
-	"embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,7 +15,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"text/template"
 	"time"
 
 	"github.com/anacrolix/torrent"
@@ -29,11 +27,7 @@ var (
 	config  *Config
 	session *Session
 	server  *Server
-	tmpl    *template.Template
 )
-
-//go:embed all:web
-var webFS embed.FS
 
 type Config struct {
 	Port      int      `json:"port"`
@@ -373,12 +367,12 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, fn, time.Now(), reader)
 }
 
-// TODO: preload templates
-func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
-	t, err := template.ParseFiles("web/dashboard.html")
-	expect(err, "Failed to parse template")
-	t.Execute(w, nil)
-}
+// // TODO: preload templates
+// func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+// 	t, err := template.ParseFiles("web/dashboard.html")
+// 	expect(err, "Failed to parse template")
+// 	t.Execute(w, nil)
+// }
 
 // TODO: rename/restructure this
 // func (s *Server) torrentinfo(w http.ResponseWriter, r *http.Request) {
