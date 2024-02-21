@@ -45,10 +45,9 @@ type Session struct {
 	file string
 }
 
-// TODO: maybe url only the /stream?f=key and not include localhost
 type TorrentInfo struct {
+	Id   string
 	Name string
-	Url  string
 	Time time.Time
 	file *torrent.File
 }
@@ -63,7 +62,15 @@ type Server struct {
 
 type Response struct {
 	Message string   `json:"message"`
-	Urls    []string `json:"urls,omitempty"`
+	Ids     []string `json:"ids,omitempty"`
+}
+
+func Map[T, V any](ts []T, fn func(T) V) []V {
+	result := make([]V, len(ts))
+	for i, t := range ts {
+		result[i] = fn(t)
+	}
+	return result
 }
 
 func expect(err error, msg string) {
@@ -200,7 +207,7 @@ func createServer() *Server {
 	// TODO: restructure
 	http.HandleFunc("/magneto", server.ping)
 	http.HandleFunc("/stop", server.stop)
-	http.HandleFunc("/play", server.play)
+	http.HandleFunc("/add", server.add)
 
 	http.HandleFunc("/stream", server.stream)
 
@@ -232,6 +239,7 @@ func (s *Server) start() (string, error) {
 	port := listener.Addr().(*net.TCPAddr).Port
 	// TODO: we also need the ipv4 address somewhere
 	url := fmt.Sprintf("http://localhost:%d", port)
+
 	return url, nil
 }
 
@@ -244,48 +252,44 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	s.stopChan <- os.Interrupt
 }
 
-func (s *Server) getKey(f *torrent.File) string {
+func (s *Server) getId(f *torrent.File) string {
 	id := f.Torrent().InfoHash().String() + f.DisplayPath()
 	return fmt.Sprintf("%x", md5.Sum([]byte(id)))
-}
-
-func (s *Server) getUrl(key string) string {
-	return fmt.Sprintf("%s/stream?f=%s", session.Url, key)
 }
 
 func (s *Server) addTorrent(f *torrent.File) *TorrentInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := s.getKey(f)
+	id := s.getId(f)
 
 	info := TorrentInfo{
 		Name: f.DisplayPath(),
-		Url:  s.getUrl(key),
 		Time: time.Now(),
+		Id:   id,
 		file: f,
 	}
 
-	s.torrents[key] = &info
+	s.torrents[id] = &info
 	return &info
 }
 
-func (s *Server) removeTorrent(key string) {
+func (s *Server) removeTorrent(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.torrents, key)
+	delete(s.torrents, id)
 }
 
 func (s *Server) torrentExists(t *torrent.Torrent) (bool, []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	urls := make([]string, 0)
+	ids := make([]string, 0)
 	for _, f := range t.Files() {
-		if info, exists := s.torrents[s.getKey(f)]; exists {
-			urls = append(urls, info.Url)
+		if info, exists := s.torrents[s.getId(f)]; exists {
+			ids = append(ids, info.Id)
 		}
 	}
-	return len(urls) > 0, urls
+	return len(ids) > 0, ids
 }
 
 func (s *Server) isValidFile(f *torrent.File) bool {
@@ -293,7 +297,7 @@ func (s *Server) isValidFile(f *torrent.File) bool {
 	return slices.Contains(config.Filetypes, ext)
 }
 
-func (s *Server) play(w http.ResponseWriter, r *http.Request) {
+func (s *Server) add(w http.ResponseWriter, r *http.Request) {
 	uri := r.URL.Query().Get("uri")
 	if uri == "" {
 		http.Error(w, "Missing URI", http.StatusBadRequest)
@@ -315,17 +319,17 @@ func (s *Server) play(w http.ResponseWriter, r *http.Request) {
 
 	<-t.GotInfo()
 
-	if exists, urls := s.torrentExists(t); exists {
-		s.respond(w, Response{Message: "Torrent already added", Urls: urls})
+	if exists, ids := s.torrentExists(t); exists {
+		s.respond(w, Response{Message: "Files already added", Ids: ids})
 		return
 	}
 
-	urls := make([]string, 0)
+	ids := make([]string, 0)
 	anyValid := false
 	for _, f := range t.Files() {
 		if s.isValidFile(f) {
 			info := s.addTorrent(f)
-			urls = append(urls, info.Url)
+			ids = append(ids, info.Id)
 			anyValid = true
 
 			// download first and last pieces first to start streaming asap (in theory)
@@ -340,8 +344,7 @@ func (s *Server) play(w http.ResponseWriter, r *http.Request) {
 		t.Drop()
 		http.Error(w, "No valid files", http.StatusBadRequest)
 	} else {
-		s.respond(w, Response{Message: "Torrent added", Urls: urls})
-		fmt.Printf("Torrent added: %s\n", urls)
+		s.respond(w, Response{Message: "Files added", Ids: ids})
 	}
 }
 
@@ -464,7 +467,7 @@ func start_or_play(uri string) {
 }
 
 func play(uri string) {
-	url := session.Url + "/play?uri=" + uri
+	url := session.Url + "/add?uri=" + uri
 	resp, err := http.Get(url)
 	expect(err, "Error requesting play")
 	defer resp.Body.Close()
@@ -475,29 +478,27 @@ func play(uri string) {
 			log.Printf("Error decoding response: %v\n", err)
 		}
 
+		urls := Map(res.Ids, func(id string) string { return session.Url + "/stream?f=" + id })
+
 		if config.AutoPlay {
-			args := append(config.Playback[1:], res.Urls...)
+			args := append(config.Playback[1:], urls...)
 			cmd := exec.Command(config.Playback[0], args...)
 			expect(cmd.Start(), "Failed to start playback")
 		} else {
 			fmt.Println(res.Message)
-			for _, u := range res.Urls {
-				fmt.Println(u)
+			for i, url := range urls {
+				fmt.Println(i, url)
 			}
 		}
 	} else if resp.StatusCode == http.StatusBadRequest {
-		if len(config.Fallback) > 0 && config.Fallback[0] != "" {
-			args := append(config.Fallback[1:], uri)
-			cmd := exec.Command(config.Fallback[0], args...)
-			expect(cmd.Start(), "Failed to open fallback")
-		} else {
-			fmt.Println("No fallback defined")
-		}
+		args := append(config.Fallback[1:], uri)
+		cmd := exec.Command(config.Fallback[0], args...)
+		expect(cmd.Start(), "Failed to open fallback")
 	}
 }
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile) // Configure log package to show file name and line number
+	log.SetFlags(log.Ldate | log.Ltime)
 
 	flag.Parse()
 
