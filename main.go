@@ -31,6 +31,7 @@ var (
 
 type Config struct {
 	Port      int      `json:"port"`
+	AutoPlay  bool     `json:"autoplay"`
 	Filetypes []string `json:"filetypes"`
 	Playback  []string `json:"playback"`
 	Fallback  []string `json:"fallback"`
@@ -85,6 +86,7 @@ func loadJSON(file string, v interface{}) error {
 func loadConfig() (*Config, error) {
 	config := Config{
 		Port:      8000,
+		AutoPlay:  true,
 		Filetypes: []string{".mkv", ".mp4"},
 		Playback:  []string{"mpv", "--no-terminal", "--force-window", "--ytdl-format=best"},
 		Fallback:  []string{"qbittorrent"},
@@ -473,16 +475,24 @@ func play(uri string) {
 			log.Printf("Error decoding response: %v\n", err)
 		}
 
-		args := append(config.Playback[1:], res.Urls...)
-		cmd := exec.Command(config.Playback[0], args...)
-		expect(cmd.Start(), "Failed to start playback")
-
-		fmt.Printf("Started playback with PID %d\n", cmd.Process.Pid)
+		if config.AutoPlay {
+			args := append(config.Playback[1:], res.Urls...)
+			cmd := exec.Command(config.Playback[0], args...)
+			expect(cmd.Start(), "Failed to start playback")
+		} else {
+			fmt.Println(res.Message)
+			for _, u := range res.Urls {
+				fmt.Println(u)
+			}
+		}
 	} else if resp.StatusCode == http.StatusBadRequest {
-
-		args := append(config.Fallback[1:], uri)
-		cmd := exec.Command(config.Fallback[0], args...)
-		expect(cmd.Start(), "Failed to open fallback")
+		if len(config.Fallback) > 0 && config.Fallback[0] != "" {
+			args := append(config.Fallback[1:], uri)
+			cmd := exec.Command(config.Fallback[0], args...)
+			expect(cmd.Start(), "Failed to open fallback")
+		} else {
+			fmt.Println("No fallback defined")
+		}
 	}
 }
 
