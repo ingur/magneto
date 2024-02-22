@@ -40,7 +40,7 @@ type Config struct {
 }
 
 type Session struct {
-	PID  int    `json:"pid"`
+	Pid  int    `json:"pid"`
 	Url  string `json:"url"`
 	file string
 }
@@ -86,6 +86,23 @@ func loadJSON(file string, v interface{}) error {
 	}
 	err = json.Unmarshal(data, v)
 	return err
+}
+
+func getLocalIP() string {
+	resp, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+
+	for _, addr := range resp {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+
+	return ""
 }
 
 // Config Methods
@@ -153,13 +170,13 @@ func (s *Session) wait(timeout time.Duration) error {
 }
 
 func (s *Session) exists() bool {
-	if s.PID == 0 || s.Url == "" {
+	if s.Pid == 0 && s.Url == "" {
 		return false
 	}
 
 	resp, err := http.Get(s.Url + "/magneto")
 	if err != nil {
-		log.Printf("Error pinging server: %v\n", err)
+		fmt.Printf("Error connecting to server: %v\n", err)
 		return false
 	}
 	defer resp.Body.Close()
@@ -208,6 +225,7 @@ func createServer() *Server {
 	http.HandleFunc("/magneto", server.ping)
 	http.HandleFunc("/stop", server.stop)
 	http.HandleFunc("/add", server.add)
+	http.HandleFunc("/del", server.del)
 
 	http.HandleFunc("/stream", server.stream)
 
@@ -224,10 +242,10 @@ func (s *Server) respond(w http.ResponseWriter, res Response) {
 	}
 }
 
-func (s *Server) start() (string, error) {
+func (s *Server) start() (int, error) {
 	listener, err := net.Listen("tcp", s.srv.Addr)
 	if err != nil {
-		return "", err
+		return 0, err
 	}
 
 	go func() {
@@ -237,10 +255,8 @@ func (s *Server) start() (string, error) {
 	}()
 
 	port := listener.Addr().(*net.TCPAddr).Port
-	// TODO: we also need the ipv4 address somewhere
-	url := fmt.Sprintf("http://localhost:%d", port)
 
-	return url, nil
+	return port, nil
 }
 
 func (s *Server) ping(w http.ResponseWriter, r *http.Request) {
@@ -305,14 +321,18 @@ func (s *Server) add(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var t *torrent.Torrent
+	var err error
 	switch {
 	case strings.HasPrefix(uri, "magnet:"):
-		t, _ = s.client.AddMagnet(uri)
+		t, err = s.client.AddMagnet(uri)
 	case strings.HasSuffix(uri, ".torrent"):
-		t, _ = s.client.AddTorrentFromFile(uri)
+		t, err = s.client.AddTorrentFromFile(uri)
 	default:
 		http.Error(w, "Unsupported URI format", http.StatusBadRequest)
 		return
+	}
+	if err != nil {
+		http.Error(w, "Error adding torrent", http.StatusBadRequest)
 	}
 
 	log.Printf("Loading torrent info...")
@@ -321,6 +341,7 @@ func (s *Server) add(w http.ResponseWriter, r *http.Request) {
 
 	if exists, ids := s.torrentExists(t); exists {
 		s.respond(w, Response{Message: "Files already added", Ids: ids})
+		log.Printf("%s - %d file(s) already added", t.Info().Name, len(ids))
 		return
 	}
 
@@ -331,7 +352,6 @@ func (s *Server) add(w http.ResponseWriter, r *http.Request) {
 			info := s.addTorrent(f)
 			ids = append(ids, info.Id)
 			anyValid = true
-
 			// download first and last pieces first to start streaming asap (in theory)
 			t.Piece(f.EndPieceIndex() - 1).SetPriority(torrent.PiecePriorityNow)
 			t.Piece(f.BeginPieceIndex()).SetPriority(torrent.PiecePriorityNow)
@@ -345,7 +365,25 @@ func (s *Server) add(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No valid files", http.StatusBadRequest)
 	} else {
 		s.respond(w, Response{Message: "Files added", Ids: ids})
+		log.Printf("%s - %d file(s) added", t.Info().Name, len(ids))
 	}
+}
+
+func (s *Server) del(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "Missing ID", http.StatusBadRequest)
+		return
+	}
+	info, ok := s.torrents[id]
+	if !ok {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+	info.file.SetPriority(torrent.PiecePriorityNone)
+	s.removeTorrent(id)
+	s.respond(w, Response{Message: "File removed"})
+	log.Printf("File removed: %s", info.Name)
 }
 
 func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
@@ -402,32 +440,6 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 // }
 
 // Main Methods
-
-func start() {
-	if session.exists() {
-		log.Println("Server already running. Exiting...")
-		return
-	}
-
-	cmd := exec.Command(ex, "serve")
-	expect(cmd.Start(), "Failed to start server")
-	log.Printf("Started server with PID %d\n", cmd.Process.Pid)
-}
-
-func stop() {
-	if !session.exists() {
-		log.Println("Server not running. Exiting...")
-		session.delete()
-		return
-	}
-
-	log.Printf("Stopping server with PID %d\n", session.PID)
-
-	if _, err := http.Get(session.Url + "/stop"); err != nil {
-		log.Printf("Error stopping server: %v\n", err)
-	}
-}
-
 func serve() {
 	server = createServer()
 
@@ -435,15 +447,16 @@ func serve() {
 	// tmpl, err = template.ParseFS(webFS, "index.html")
 	// expect(err, "Failed to parse template")
 
-	url, err := server.start()
+	port, err := server.start()
 	expect(err, "Failed to start server")
 
-	session.PID = os.Getpid()
+	url := fmt.Sprintf("http://localhost:%d", port)
+	log.Printf("Server running at %s/\n", url)
+
+	session.Pid = os.Getpid()
 	session.Url = url
 
 	expect(session.save(), "Failed to save session")
-
-	log.Printf("Server running at %s\n", url)
 
 	<-server.stopChan
 
@@ -453,6 +466,61 @@ func serve() {
 
 	os.RemoveAll(config.Path)
 	os.MkdirAll(config.Path, os.ModePerm)
+}
+
+func start() {
+	if session.exists() {
+		fmt.Println("Server already running. Exiting...")
+		return
+	}
+
+	cmd := exec.Command(ex, "serve")
+	expect(cmd.Start(), "Failed to start server")
+	fmt.Printf("Starting server process with Pid %d...\n", cmd.Process.Pid)
+	if config.Port != 0 {
+		fmt.Printf("Server will be accessible at http://localhost:%d/\n", config.Port)
+		fmt.Printf("and http://%s:%d/\n", getLocalIP(), config.Port)
+	}
+}
+
+func stop() {
+	if !session.exists() {
+		fmt.Println("Server not running. Exiting...")
+		session.delete()
+		return
+	}
+
+	fmt.Printf("Stopping server with Pid %d\n", session.Pid)
+
+	if _, err := http.Get(session.Url + "/stop"); err != nil {
+		log.Printf("Error stopping server: %v\n", err)
+	}
+}
+
+func connect(url string) {
+	if url == "" {
+		fmt.Println("Usage: <executable> connect <url>")
+		return
+	}
+
+	resp, err := http.Get(url + "/magneto")
+	if err != nil {
+		fmt.Printf("Error connecting to server: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		session.Url = url
+		expect(session.save(), "Failed to save session")
+		fmt.Printf("Connected to server at %s\n", url)
+	} else {
+		fmt.Printf("Error connecting to server: %s\n", resp.Status)
+	}
+}
+
+func disconnect() {
+	session.delete()
 }
 
 func start_or_play(uri string) {
@@ -475,20 +543,20 @@ func play(uri string) {
 	if resp.StatusCode == http.StatusOK {
 		var res Response
 		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-			log.Printf("Error decoding response: %v\n", err)
+			fmt.Printf("Error decoding server response: %v\n", err)
 		}
 
+		fmt.Println(res.Message + ":")
 		urls := Map(res.Ids, func(id string) string { return session.Url + "/stream?f=" + id })
+		for i, url := range urls {
+			fmt.Println(i, url)
+		}
 
 		if config.AutoPlay {
 			args := append(config.Playback[1:], urls...)
 			cmd := exec.Command(config.Playback[0], args...)
 			expect(cmd.Start(), "Failed to start playback")
-		} else {
-			fmt.Println(res.Message)
-			for i, url := range urls {
-				fmt.Println(i, url)
-			}
+			fmt.Printf("Playing %d file(s)\n", len(urls))
 		}
 	} else if resp.StatusCode == http.StatusBadRequest {
 		args := append(config.Fallback[1:], uri)
@@ -514,7 +582,7 @@ func main() {
 
 	cmd := flag.Arg(0)
 	if cmd == "" {
-		log.Println("Usage: <executable> <start|stop>")
+		fmt.Println("Usage: magneto <start|stop|connect|disconnect>")
 		return
 	}
 
@@ -528,6 +596,10 @@ func main() {
 		start()
 	case "stop":
 		stop()
+	case "connect":
+		connect(flag.Arg(1))
+	case "disconnect":
+		disconnect()
 	case "serve":
 		serve()
 	default:
