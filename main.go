@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/anacrolix/torrent"
@@ -55,6 +57,7 @@ type TorrentInfo struct {
 type Server struct {
 	mu       sync.Mutex
 	srv      *http.Server
+	restart  bool
 	stopChan chan os.Signal
 	client   *torrent.Client
 	torrents map[string]*TorrentInfo
@@ -201,13 +204,17 @@ func createServer() *Server {
 	port := config.Port
 	server := Server{
 		srv:      &http.Server{Addr: ":" + fmt.Sprint(port)},
+		restart:  false,
 		stopChan: make(chan os.Signal, 1),
 		torrents: make(map[string]*TorrentInfo),
 	}
 
+	signal.Notify(server.stopChan, os.Interrupt, syscall.SIGTERM)
+
 	os.RemoveAll(config.Path)
 	err := os.MkdirAll(config.Path, os.ModePerm)
 	expect(err, "Failed to create downloads directory")
+
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DefaultStorage = storage.NewFileByInfoHash(config.Path)
 
@@ -263,7 +270,20 @@ func (s *Server) ping(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
-	s.respond(w, Response{Message: "Stopping server..."}, http.StatusOK)
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if !(ip == "127.0.0.1" || ip == "::1") {
+		s.respond(w, Response{Message: "Unauthorized"}, http.StatusUnauthorized)
+		return
+	}
+
+	restart := r.URL.Query().Get("restart")
+	if restart == "true" {
+		s.restart = true
+		s.respond(w, Response{Message: "Restarting server..."}, http.StatusOK)
+	} else {
+		s.respond(w, Response{Message: "Stopping server..."}, http.StatusOK)
+	}
+
 	s.stopChan <- os.Interrupt
 }
 
@@ -468,6 +488,12 @@ func serve() {
 
 	os.RemoveAll(config.Path)
 	os.MkdirAll(config.Path, os.ModePerm)
+
+	if server.restart {
+		cmd := exec.Command(ex, "serve")
+		expect(cmd.Start(), "Failed to restart server")
+		log.Printf("Restarting server process (Pid %d)...\n", cmd.Process.Pid)
+	}
 }
 
 func start() {
@@ -478,7 +504,7 @@ func start() {
 
 	cmd := exec.Command(ex, "serve")
 	expect(cmd.Start(), "Failed to start server")
-	fmt.Printf("Starting server process with Pid %d...\n", cmd.Process.Pid)
+	fmt.Printf("Starting server process (Pid %d)...\n", cmd.Process.Pid)
 	if config.Port != 0 {
 		fmt.Printf("Server will be accessible at http://localhost:%d/\n", config.Port)
 		fmt.Printf("and http://%s:%d/\n", getLocalIP(), config.Port)
