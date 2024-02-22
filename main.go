@@ -327,6 +327,7 @@ func (s *Server) add(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		s.respond(w, Response{Message: "Error adding torrent: " + err.Error()}, http.StatusBadRequest)
+		return
 	}
 
 	log.Printf("Loading torrent info...")
@@ -379,6 +380,7 @@ func (s *Server) del(w http.ResponseWriter, r *http.Request) {
 	err := os.Remove(path)
 	if err != nil {
 		s.respond(w, Response{Message: "Error removing file"}, http.StatusInternalServerError)
+		return
 	}
 
 	s.respond(w, Response{Message: "File removed"}, http.StatusOK)
@@ -388,6 +390,7 @@ func (s *Server) play(w http.ResponseWriter, r *http.Request) {
 	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
 	if !(ip == "127.0.0.1" || ip == "::1") {
 		s.respond(w, Response{Message: "Unauthorized"}, http.StatusUnauthorized)
+		return
 	}
 
 	id := r.URL.Query().Get("f")
