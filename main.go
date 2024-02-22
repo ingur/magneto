@@ -101,7 +101,6 @@ func getLocalIP() string {
 			}
 		}
 	}
-
 	return ""
 }
 
@@ -221,16 +220,12 @@ func createServer() *Server {
 	server.client = client
 
 	// setup routes
-	// TODO: restructure
 	http.HandleFunc("/magneto", server.ping)
 	http.HandleFunc("/stop", server.stop)
 	http.HandleFunc("/add", server.add)
 	http.HandleFunc("/del", server.del)
 
 	http.HandleFunc("/stream", server.stream)
-
-	// http.HandleFunc("/", server.dashboard)
-	// http.HandleFunc("/torrents", server.torrentinfo)
 
 	return &server
 }
@@ -410,42 +405,9 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, fn, time.Now(), reader)
 }
 
-// // TODO: preload templates
-// func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
-// 	t, err := template.ParseFiles("web/dashboard.html")
-// 	expect(err, "Failed to parse template")
-// 	t.Execute(w, nil)
-// }
-
-// TODO: rename/restructure this
-// func (s *Server) torrentinfo(w http.ResponseWriter, r *http.Request) {
-// 	t, err := template.ParseFiles("web/torrents.html")
-// 	expect(err, "Failed to parse template")
-//
-// 	res := make([]TorrentInfo, 0)
-// 	for _, f := range s.torrents {
-// 		info := TorrentInfo{}
-// 		info.Name = f.DisplayPath()
-// 		info.Date = "today"
-// 		info.Progress = int(f.BytesCompleted() * 100 / f.Length())
-// 		res = append(res, info)
-// 	}
-//
-// 	log.Printf("Torrents: %v\n", res)
-//
-// 	err = t.Execute(w, res)
-// 	if err != nil {
-// 		log.Printf("Error executing template: %v", err)
-// 	}
-// }
-
 // Main Methods
 func serve() {
 	server = createServer()
-
-	// var err error
-	// tmpl, err = template.ParseFS(webFS, "index.html")
-	// expect(err, "Failed to parse template")
 
 	port, err := server.start()
 	expect(err, "Failed to start server")
