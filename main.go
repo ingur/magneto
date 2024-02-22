@@ -224,17 +224,21 @@ func createServer() *Server {
 	http.HandleFunc("/stop", server.stop)
 	http.HandleFunc("/add", server.add)
 	http.HandleFunc("/del", server.del)
+	http.HandleFunc("/play", server.play)
+	http.HandleFunc("/download", server.download)
 
 	http.HandleFunc("/stream", server.stream)
 
 	return &server
 }
 
-func (s *Server) respond(w http.ResponseWriter, res Response) {
+func (s *Server) respond(w http.ResponseWriter, res Response, code int) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
 	if err := json.NewEncoder(w).Encode(res); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+	log.Printf("%s: %s", http.StatusText(code), res.Message)
 }
 
 func (s *Server) start() (int, error) {
@@ -259,7 +263,7 @@ func (s *Server) ping(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
-	s.respond(w, Response{Message: "Stopping server..."})
+	s.respond(w, Response{Message: "Stopping server..."}, http.StatusOK)
 	s.stopChan <- os.Interrupt
 }
 
@@ -275,9 +279,9 @@ func (s *Server) addTorrent(f *torrent.File) *TorrentInfo {
 	id := s.getId(f)
 
 	info := TorrentInfo{
+		Id:   id,
 		Name: f.DisplayPath(),
 		Time: time.Now(),
-		Id:   id,
 		file: f,
 	}
 
@@ -285,22 +289,17 @@ func (s *Server) addTorrent(f *torrent.File) *TorrentInfo {
 	return &info
 }
 
+func (s *Server) getTorrent(id string) (*TorrentInfo, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.torrents[id]
+	return t, ok
+}
+
 func (s *Server) removeTorrent(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.torrents, id)
-}
-
-func (s *Server) torrentExists(t *torrent.Torrent) (bool, []string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ids := make([]string, 0)
-	for _, f := range t.Files() {
-		if info, exists := s.torrents[s.getId(f)]; exists {
-			ids = append(ids, info.Id)
-		}
-	}
-	return len(ids) > 0, ids
 }
 
 func (s *Server) isValidFile(f *torrent.File) bool {
@@ -311,7 +310,7 @@ func (s *Server) isValidFile(f *torrent.File) bool {
 func (s *Server) add(w http.ResponseWriter, r *http.Request) {
 	uri := r.URL.Query().Get("uri")
 	if uri == "" {
-		http.Error(w, "Missing URI", http.StatusBadRequest)
+		s.respond(w, Response{Message: "Missing URI"}, http.StatusBadRequest)
 		return
 	}
 
@@ -323,28 +322,25 @@ func (s *Server) add(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(uri, ".torrent"):
 		t, err = s.client.AddTorrentFromFile(uri)
 	default:
-		http.Error(w, "Unsupported URI format", http.StatusBadRequest)
+		s.respond(w, Response{Message: "Unsupported URI format"}, http.StatusBadRequest)
 		return
 	}
 	if err != nil {
-		http.Error(w, "Error adding torrent", http.StatusBadRequest)
+		s.respond(w, Response{Message: "Error adding torrent: " + err.Error()}, http.StatusBadRequest)
 	}
 
 	log.Printf("Loading torrent info...")
 
 	<-t.GotInfo()
 
-	if exists, ids := s.torrentExists(t); exists {
-		s.respond(w, Response{Message: "Files already added", Ids: ids})
-		log.Printf("%s - %d file(s) already added", t.Info().Name, len(ids))
-		return
-	}
-
 	ids := make([]string, 0)
 	anyValid := false
 	for _, f := range t.Files() {
 		if s.isValidFile(f) {
-			info := s.addTorrent(f)
+			info, exists := s.getTorrent(s.getId(f))
+			if !exists {
+				info = s.addTorrent(f)
+			}
 			ids = append(ids, info.Id)
 			anyValid = true
 			// download first and last pieces first to start streaming asap (in theory)
@@ -357,49 +353,90 @@ func (s *Server) add(w http.ResponseWriter, r *http.Request) {
 
 	if !anyValid {
 		t.Drop()
-		http.Error(w, "No valid files", http.StatusBadRequest)
+		s.respond(w, Response{Message: "No valid files"}, http.StatusBadRequest)
 	} else {
-		s.respond(w, Response{Message: "Files added", Ids: ids})
-		log.Printf("%s - %d file(s) added", t.Info().Name, len(ids))
+		s.respond(w, Response{Message: "Files added", Ids: ids}, http.StatusOK)
 	}
 }
 
 func (s *Server) del(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		http.Error(w, "Missing ID", http.StatusBadRequest)
-		return
-	}
-	info, ok := s.torrents[id]
+	id := r.URL.Query().Get("f")
+
+	info, ok := s.getTorrent(id)
 	if !ok {
-		http.Error(w, "File not found", http.StatusNotFound)
+		s.respond(w, Response{Message: "File not found"}, http.StatusNotFound)
 		return
 	}
-	info.file.SetPriority(torrent.PiecePriorityNone)
+
+	ih := info.file.Torrent().InfoHash().String()
+	rel := info.file.Path()
+
+	path := filepath.Join(config.Path, ih, rel)
+
+	info.file.Torrent().Drop()
 	s.removeTorrent(id)
-	s.respond(w, Response{Message: "File removed"})
-	log.Printf("File removed: %s", info.Name)
+
+	err := os.Remove(path)
+	if err != nil {
+		s.respond(w, Response{Message: "Error removing file"}, http.StatusInternalServerError)
+	}
+
+	s.respond(w, Response{Message: "File removed"}, http.StatusOK)
+}
+
+func (s *Server) play(w http.ResponseWriter, r *http.Request) {
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if !(ip == "127.0.0.1" || ip == "::1") {
+		s.respond(w, Response{Message: "Unauthorized"}, http.StatusUnauthorized)
+	}
+
+	id := r.URL.Query().Get("f")
+
+	_, ok := s.getTorrent(id)
+	if !ok {
+		s.respond(w, Response{Message: "File not found"}, http.StatusNotFound)
+		return
+	}
+
+	args := append(config.Playback[1:], session.Url+"/stream?f="+id)
+	cmd := exec.Command(config.Playback[0], args...)
+	if err := cmd.Start(); err != nil {
+		s.respond(w, Response{Message: "Error starting playback"}, http.StatusInternalServerError)
+	} else {
+		s.respond(w, Response{Message: "Playback started"}, http.StatusOK)
+	}
+}
+
+func (s *Server) download(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("f")
+
+	info, ok := s.getTorrent(id)
+	if !ok {
+		s.respond(w, Response{Message: "File not found"}, http.StatusNotFound)
+		return
+	}
+
+	info.file.Download()
+	s.respond(w, Response{Message: "Downloading file"}, http.StatusOK)
 }
 
 func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
-	key := r.URL.Query().Get("f")
-	key = strings.TrimSpace(key)
-	key = strings.ReplaceAll(key, "\n", "")
+	id := r.URL.Query().Get("f")
 
-	t, ok := s.torrents[key]
+	info, ok := s.getTorrent(id)
 	if !ok {
-		http.Error(w, "File not found", http.StatusNotFound)
+		s.respond(w, Response{Message: "File not found"}, http.StatusNotFound)
 		return
 	}
 
-	fn := t.file.DisplayPath()
+	fn := info.file.DisplayPath()
 
 	w.Header().Set("Expires", "0")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")
 	w.Header().Set("Content-Disposition", "attachment; filename="+fn)
 
-	reader := t.file.NewReader()
-	reader.SetReadahead(t.file.Length() / 100)
+	reader := info.file.NewReader()
+	reader.SetReadahead(info.file.Length() / 100)
 	reader.SetResponsive()
 
 	http.ServeContent(w, r, fn, time.Now(), reader)
