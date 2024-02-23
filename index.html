@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/htmx.org"></script>
+  <script src="https://unpkg.com/htmx.org/dist/ext/client-side-templates.js"></script>
+  <script src="https://unpkg.com/handlebars@latest/dist/handlebars.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        colors: {
+          main: "#1E1E1E",
+          container: "#2A2C2D",
+          white: "#D1C6B1",
+          gray: "#494949",
+          red: "#D3869B",
+          green: "#89B482",
+          blue: "#7DAEA3",
+          purple: "#A09ACE",
+        },
+        extend: {
+          fontFamily: {
+            'poppins': ['Poppins', 'sans-serif']
+          },
+        },
+      },
+    }
+  </script>
+</head>
+
+<body class="bg-main font-poppins">
+  <div class="container mx-auto my-0 sm:my-6 p-4 rounded-lg bg-container">
+    <div class="header-bar flex pb-4">
+      <div class="header-title text-3xl text-white">
+        Torrents
+      </div>
+      <div class="flex-grow"></div>
+      <div class="header-buttons flex space-x-2">
+        <button class="refresh-button" hx-get="/stop?restart=true" hx-trigger="click" hx-swap="none">
+          <svg class="w-6 h-6 fill-white" mlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+            <path
+              d="M 2 2 L 4.9394531 4.9394531 C 3.1262684 6.7482143 2 9.2427079 2 12 C 2 17.514 6.486 22 12 22 C 17.514 22 22 17.514 22 12 C 22 6.486 17.514 2 12 2 L 12 4 C 16.411 4 20 7.589 20 12 C 20 16.411 16.411 20 12 20 C 7.589 20 4 16.411 4 12 C 4 9.7940092 4.9004767 7.7972757 6.3496094 6.3496094 L 9 9 L 9 2 L 2 2 z" />
+          </svg>
+        </button>
+      </div>
+    </div>
+    <div class="torrent-container my-2" hx-ext="client-side-templates">
+      <div id="torrents" hx-get="/torrents" hx-trigger="load, every 1s" hx-swap="innerHTML"
+        handlebars-template="torrent-template">
+      </div>
+      <script id="torrent-template" type="text/x-handlebars-template">
+        {{#each torrents}}
+        <div class="torrent-row my-5">
+          <div class="torrent-info flex flex-grow mb-3">
+            <div class="torrent-name pointer-events-auto cursor-pointer text-sm text-white pr-2">
+              {{this.name}}
+            </div>
+            <div class="flex-grow px-2">
+            </div>
+            <div class="torrent-buttons flex space-x-2">
+              {{#if ../local}}
+              <button class="torrent-play px-1" hx-get="/play?f={{this.id}}" hx-trigger="click" hx-swap="none">
+                <svg class="w-6 h-6 fill-green" mlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                  <path fill-rule="evenodd"
+                    d="M4.5 5.653c0-1.427 1.529-2.33 2.779-1.643l11.54 6.347c1.295.712 1.295 2.573 0 3.286L7.28 19.99c-1.25.687-2.779-.217-2.779-1.643V5.653Z"
+                    clip-rule="evenodd" />
+                </svg>
+              </button>
+              {{/if}}
+              <button class="torrent-url px-1">
+                <a href="/stream?f={{this.id}}">
+                <svg class="w-6 h-6 fill-purple" mlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                  <path fill-rule="evenodd" d="M19.902 4.098a3.75 3.75 0 0 0-5.304 0l-4.5 4.5a3.75 3.75 0 0 0 1.035 6.037.75.75 0 0 1-.646 1.353 5.25 5.25 0 0 1-1.449-8.45l4.5-4.5a5.25 5.25 0 1 1 7.424 7.424l-1.757 1.757a.75.75 0 1 1-1.06-1.06l1.757-1.757a3.75 3.75 0 0 0 0-5.304Zm-7.389 4.267a.75.75 0 0 1 1-.353 5.25 5.25 0 0 1 1.449 8.45l-4.5 4.5a5.25 5.25 0 1 1-7.424-7.424l1.757-1.757a.75.75 0 1 1 1.06 1.06l-1.757 1.757a3.75 3.75 0 1 0 5.304 5.304l4.5-4.5a3.75 3.75 0 0 0-1.035-6.037.75.75 0 0 1-.354-1Z" clip-rule="evenodd" />
+                </svg>
+                </a>
+              </button>
+              <button class="torrent-download px-1" hx-get="/download?f={{this.id}}" hx-trigger="click" hx-swap="none">
+                {{#if this.download}} 
+                <svg class="w-6 h-6 fill-blue" mlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                  <path fill-rule="evenodd" d="M6.75 5.25a.75.75 0 0 1 .75-.75H9a.75.75 0 0 1 .75.75v13.5a.75.75 0 0 1-.75.75H7.5a.75.75 0 0 1-.75-.75V5.25Zm7.5 0A.75.75 0 0 1 15 4.5h1.5a.75.75 0 0 1 .75.75v13.5a.75.75 0 0 1-.75.75H15a.75.75 0 0 1-.75-.75V5.25Z" clip-rule="evenodd" />
+                </svg>
+                {{else}}
+                <svg class="w-6 h-6 fill-blue" viewBox="0 0 24 24" fill="currentColor">
+                <path fill-rule="evenodd" d="M12 2.25a.75.75 0 0 1 .75.75v11.69l3.22-3.22a.75.75 0 1 1 1.06 1.06l-4.5 4.5a.75.75 0 0 1-1.06 0l-4.5-4.5a.75.75 0 1 1 1.06-1.06l3.22 3.22V3a.75.75 0 0 1 .75-.75Zm-9 13.5a.75.75 0 0 1 .75.75v2.25a1.5 1.5 0 0 0 1.5 1.5h13.5a1.5 1.5 0 0 0 1.5-1.5V16.5a.75.75 0 0 1 1.5 0v2.25a3 3 0 0 1-3 3H5.25a3 3 0 0 1-3-3V16.5a.75.75 0 0 1 .75-.75Z" clip-rule="evenodd" />
+                </svg>
+                {{/if}}
+              </button>
+              <button class="torrent-delete px-1" hx-get="/del?f={{this.id}}" hx-trigger="click" hx-swap="none">
+                <svg class="w-6 h-6 fill-red" mlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                  <path fill-rule="evenodd"
+                    d="M5.47 5.47a.75.75 0 0 1 1.06 0L12 10.94l5.47-5.47a.75.75 0 1 1 1.06 1.06L13.06 12l5.47 5.47a.75.75 0 1 1-1.06 1.06L12 13.06l-5.47 5.47a.75.75 0 0 1-1.06-1.06L10.94 12 5.47 6.53a.75.75 0 0 1 0-1.06Z"
+                    clip-rule="evenodd" />
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="torrent-progress">
+            <div class="torrent-total rounded-full w-full h-1 bg-gray">
+              <div class="torrent-current rounded-full h-1 bg-blue" style="width:{{this.progress}}%;"></div>
+            </div>
+          </div>
+        </div>
+        {{/each}}
+      </script>
+    </div>
+</body>
+
+</html>

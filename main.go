@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/md5"
+	"embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,7 +14,9 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -30,6 +33,9 @@ var (
 	session *Session
 	server  *Server
 )
+
+//go:embed index.html
+var embedfs embed.FS
 
 type Config struct {
 	Port      int      `json:"port"`
@@ -48,24 +54,28 @@ type Session struct {
 }
 
 type TorrentInfo struct {
-	Id   string
-	Name string
-	Time time.Time
-	file *torrent.File
+	Id       string    `json:"id"`
+	Name     string    `json:"name"`
+	Progress int       `json:"progress"`
+	Download bool      `json:"download"`
+	Time     time.Time `json:"time"`
+	file     *torrent.File
 }
 
 type Server struct {
-	mu       sync.Mutex
-	srv      *http.Server
-	restart  bool
-	stopChan chan os.Signal
-	client   *torrent.Client
-	torrents map[string]*TorrentInfo
+	mu          sync.Mutex
+	srv         *http.Server
+	restart     bool
+	stopChan    chan os.Signal
+	client      *torrent.Client
+	torrentInfo map[string]*TorrentInfo
 }
 
 type Response struct {
-	Message string   `json:"message"`
-	Ids     []string `json:"ids,omitempty"`
+	Message  string         `json:"message,omitempty"`
+	Ids      []string       `json:"ids,omitempty"`
+	Torrents []*TorrentInfo `json:"torrents,omitempty"`
+	Local    *bool          `json:"local,omitempty"`
 }
 
 func Map[T, V any](ts []T, fn func(T) V) []V {
@@ -203,10 +213,10 @@ func (s *Session) delete() error {
 func createServer() *Server {
 	port := config.Port
 	server := Server{
-		srv:      &http.Server{Addr: ":" + fmt.Sprint(port)},
-		restart:  false,
-		stopChan: make(chan os.Signal, 1),
-		torrents: make(map[string]*TorrentInfo),
+		srv:         &http.Server{Addr: ":" + fmt.Sprint(port)},
+		restart:     false,
+		stopChan:    make(chan os.Signal, 1),
+		torrentInfo: make(map[string]*TorrentInfo),
 	}
 
 	signal.Notify(server.stopChan, os.Interrupt, syscall.SIGTERM)
@@ -233,8 +243,10 @@ func createServer() *Server {
 	http.HandleFunc("/del", server.del)
 	http.HandleFunc("/play", server.play)
 	http.HandleFunc("/download", server.download)
-
+	http.HandleFunc("/torrents", server.torrents)
 	http.HandleFunc("/stream", server.stream)
+
+	http.HandleFunc("/", server.dashboard)
 
 	return &server
 }
@@ -270,12 +282,6 @@ func (s *Server) ping(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
-	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if !(ip == "127.0.0.1" || ip == "::1") {
-		s.respond(w, Response{Message: "Unauthorized"}, http.StatusUnauthorized)
-		return
-	}
-
 	restart := r.URL.Query().Get("restart")
 	if restart == "true" {
 		s.restart = true
@@ -283,7 +289,6 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	} else {
 		s.respond(w, Response{Message: "Stopping server..."}, http.StatusOK)
 	}
-
 	s.stopChan <- os.Interrupt
 }
 
@@ -305,21 +310,38 @@ func (s *Server) addTorrent(f *torrent.File) *TorrentInfo {
 		file: f,
 	}
 
-	s.torrents[id] = &info
+	s.torrentInfo[id] = &info
 	return &info
 }
 
 func (s *Server) getTorrent(id string) (*TorrentInfo, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t, ok := s.torrents[id]
+	t, ok := s.torrentInfo[id]
 	return t, ok
+}
+
+func (s *Server) getTorrents() []*TorrentInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	torrents := make([]*TorrentInfo, 0, len(s.torrentInfo))
+	for _, info := range s.torrentInfo {
+		info.Progress = int(info.file.BytesCompleted() * 100 / info.file.Length())
+		torrents = append(torrents, info)
+	}
+
+	sort.Slice(torrents, func(i, j int) bool {
+		return torrents[i].Time.After(torrents[j].Time)
+	})
+
+	return torrents
 }
 
 func (s *Server) removeTorrent(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.torrents, id)
+	delete(s.torrentInfo, id)
 }
 
 func (s *Server) isValidFile(f *torrent.File) bool {
@@ -394,7 +416,7 @@ func (s *Server) del(w http.ResponseWriter, r *http.Request) {
 
 	path := filepath.Join(config.Path, ih, rel)
 
-	info.file.Torrent().Drop()
+	info.file.SetPriority(torrent.PiecePriorityNone)
 	s.removeTorrent(id)
 
 	err := os.Remove(path)
@@ -439,8 +461,31 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info.file.Download()
-	s.respond(w, Response{Message: "Downloading file"}, http.StatusOK)
+	if info.file.Priority() == torrent.PiecePriorityNone {
+		info.file.Download()
+		info.Download = true
+		s.respond(w, Response{Message: "Downloading file"}, http.StatusOK)
+	} else {
+		info.file.SetPriority(torrent.PiecePriorityNone)
+		info.Download = false
+		s.respond(w, Response{Message: "File download paused"}, http.StatusOK)
+	}
+}
+
+func (s *Server) torrents(w http.ResponseWriter, r *http.Request) {
+	local := new(bool)
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if ip == "127.0.0.1" || ip == "::1" {
+		*local = true
+	}
+
+	torrents := s.getTorrents()
+
+	s.respond(w, Response{
+		Message:  "Torrents",
+		Torrents: torrents,
+		Local:    local,
+	}, http.StatusOK)
 }
 
 func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
@@ -463,6 +508,10 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	reader.SetResponsive()
 
 	http.ServeContent(w, r, fn, time.Now(), reader)
+}
+
+func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+	http.ServeFileFS(w, r, embedfs, "index.html")
 }
 
 // Main Methods
@@ -556,8 +605,7 @@ func start_or_play(uri string) {
 		play(uri)
 	} else {
 		start()
-		err := session.wait(5 * time.Second)
-		expect(err, "Failed to load session")
+		expect(session.wait(5*time.Second), "Failed to load session")
 		play(uri)
 	}
 }
@@ -593,6 +641,34 @@ func play(uri string) {
 	}
 }
 
+func openBrowser(url string) error {
+	var cmd string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "cmd"
+		args = []string{"/c", "start"}
+	case "darwin":
+		cmd = "open"
+	default:
+		cmd = "xdg-open"
+	}
+	args = append(args, url)
+
+	return exec.Command(cmd, args...).Start()
+}
+
+func start_or_browser() {
+	if session.exists() {
+		expect(openBrowser(session.Url), "Failed to open browser")
+	} else {
+		start()
+		expect(session.wait(5*time.Second), "Failed to load session")
+		expect(openBrowser(session.Url), "Failed to open browser")
+	}
+}
+
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime)
 
@@ -608,15 +684,11 @@ func main() {
 	config, err = loadConfig()
 	expect(err, "Failed to load config")
 
-	cmd := flag.Arg(0)
-	if cmd == "" {
-		fmt.Println("Usage: magneto <start|stop|connect|disconnect>")
-		return
-	}
-
 	// validate that session still actually exists
 	session, err = loadSession()
 	expect(err, "Failed to load session")
+
+	cmd := flag.Arg(0)
 
 	// handle commands
 	switch cmd {
@@ -630,6 +702,8 @@ func main() {
 		disconnect()
 	case "serve":
 		serve()
+	case "":
+		start_or_browser()
 	default:
 		start_or_play(cmd)
 	}
