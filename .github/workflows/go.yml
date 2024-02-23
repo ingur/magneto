@@ -27,7 +27,7 @@ jobs:
     - name: Build windows
       run: |
         mkdir magneto
-        GOOS=windows GOARCH=amd64 go build -v -ldflags "-s -w" -o magneto/magneto.exe
+        GOOS=windows GOARCH=amd64 go build -v -ldflags "-s -w -H=windowsgui" -o magneto/magneto.exe
         cp scripts/* magneto/
         zip -r magneto_windows_x86_64.zip magneto/
         rm -rf magneto
