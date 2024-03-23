@@ -6,9 +6,11 @@
 
 ## Features
 * instantly stream magnet links / torrent files using any videoplayer that supports network streams
+* supports batch torrents
 * includes a dashboard page to easily track / control your torrents
 * customizable settings using a `config.json`
-* works as a server
+* supports fallback torrent applications for other torrents
+* works as a server/daemon
 * more stuff
 
 > Note: this is still a WIP, and a rework will come eventually. The app is still usable, but might not work perfectly for everyone yet.
