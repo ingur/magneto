@@ -1,0 +1,77 @@
+/* Magneto theme: semantic UI tokens.
+ *
+ * @theme maps each --color-<role> to var(--t-<role>), so Tailwind generates the
+ * semantic utilities once (bg-bg, text-muted, bg-success/20, ring-cursor,
+ * bg-progress-active, …) and never rebuilds on a theme change; only the leaf
+ * --t-<role> values change at runtime.
+ *
+ * The full palette is owned by the Rust app (src-tauri/src/theme.rs) and applied
+ * by theme.svelte.ts before the app mounts. The :root block below is only a
+ * first-paint guard for the page background/text during JS load; it mirrors
+ * Palette::dark()/light()'s bg + fg, nothing more.
+ */
+
+@theme {
+  /* surface */
+  --color-bg:      var(--t-bg);
+  --color-panel:   var(--t-panel);
+  --color-raised:  var(--t-raised);
+  --color-overlay: var(--t-overlay);
+  /* text */
+  --color-fg:        var(--t-fg);
+  --color-muted:     var(--t-muted);
+  --color-subtle:    var(--t-subtle);
+  --color-disabled:  var(--t-disabled);
+  --color-on-accent: var(--t-on-accent);
+  /* border */
+  --color-border: var(--t-border);
+  /* state */
+  --color-hover:  var(--t-hover);
+  --color-cursor: var(--t-cursor);
+  --color-marked: var(--t-marked);
+  /* accent */
+  --color-accent:  var(--t-accent);
+  --color-success: var(--t-success);
+  --color-warning: var(--t-warning);
+  --color-danger:  var(--t-danger);
+  --color-info:    var(--t-info);
+  --color-link:    var(--t-link);
+  /* progress */
+  --color-progress-active: var(--t-progress-active);
+  --color-progress-done:   var(--t-progress-done);
+  --color-progress-idle:   var(--t-progress-idle);
+  --color-progress-error:  var(--t-progress-error);
+  /* chrome */
+  --color-scrollbar:        var(--t-scrollbar);
+  --color-scrollbar-active: var(--t-scrollbar-active);
+  --color-backdrop:         var(--t-backdrop);
+
+  /* Terminal-flavored: one monospace face everywhere. */
+  --font-sans: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* First-paint guard. Only the page background/text need a value before
+   theme.svelte.ts applies the full palette; mirrors Palette::dark()/light()'s
+   bg + fg in src-tauri/src/theme.rs. */
+:root {
+  color-scheme: dark;
+  --t-bg: #161819;
+  --t-fg: #d1c6b1;
+  background-color: var(--t-bg);
+  color: var(--t-fg);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --t-bg: #f3f1ea;
+    --t-fg: #4d473d;
+  }
+}
+
+/* The kb cursor ring is the only navigation indicator; suppress native focus. */
+:focus,
+:focus-visible {
+  outline: none;
+}

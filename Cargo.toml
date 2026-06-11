@@ -1,0 +1,13 @@
+[workspace]
+members = ["core", "daemon", "cli", "app/src-tauri"]
+resolver = "3"
+
+# One version for everything: crates inherit it via version.workspace = true,
+# the Tauri app/bundle reads it from src-tauri's Cargo.toml (tauri.conf.json
+# declares no version), and daemon/CLI report it through CARGO_PKG_VERSION.
+[workspace.package]
+version = "0.9.0"
+license = "GPL-3.0-only"
+
+[profile.release]
+strip = true

@@ -1,0 +1,47 @@
+{
+  "name": "magneto-app",
+  "version": "0.9.0",
+  "license": "GPL-3.0-only",
+  "description": "Magneto desktop app",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "format": "prettier --write \"src/**/*.{ts,svelte}\" \"*.{ts,js}\"",
+    "format:check": "prettier --check \"src/**/*.{ts,svelte}\" \"*.{ts,js}\"",
+    "stage:daemon": "node scripts/stage-daemon.mjs",
+    "stage:daemon:release": "node scripts/stage-daemon.mjs --release",
+    "icons": "tauri icon app-icon.svg && rm -rf src-tauri/icons/android src-tauri/icons/ios",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@lucide/svelte": "^1.17.0",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-autostart": "^2",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-notification": "^2.3.3",
+    "@tauri-apps/plugin-opener": "^2.5.4",
+    "fuse.js": "^7.4.2"
+  },
+  "devDependencies": {
+    "@fontsource/jetbrains-mono": "^5",
+    "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "@tailwindcss/vite": "^4.1.10",
+    "@tauri-apps/cli": "^2",
+    "@types/node": "^22",
+    "jsdom": "^29.1.1",
+    "prettier": "^3.8.4",
+    "prettier-plugin-svelte": "^4.1.0",
+    "svelte": "^5.16.0",
+    "svelte-check": "^4.0.0",
+    "tailwindcss": "^4.1.10",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.5",
+    "vitest": "^4.1.8"
+  }
+}

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Magneto</title>
+    <!-- First-paint guard before any stylesheet arrives (e.g. the dev-server
+         roundtrip): mirrors the theme.css :root bg fallbacks. -->
+    <style>
+      html {
+        background-color: #161819;
+      }
+      @media (prefers-color-scheme: light) {
+        html {
+          background-color: #f3f1ea;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

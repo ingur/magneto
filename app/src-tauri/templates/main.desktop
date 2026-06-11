@@ -1,0 +1,17 @@
+# Tauri's stock desktop-entry template with two changes: %U on the Exec line
+# (without a field code the OS launches the handler with no URL/path argument,
+# so magnet clicks and .torrent opens would arrive empty) and fixed Categories.
+[Desktop Entry]
+Categories=Network;FileTransfer;P2P;
+{{#if comment}}
+Comment={{comment}}
+{{/if}}
+Exec={{exec}} %U
+StartupWMClass={{exec}}
+Icon={{icon}}
+Name={{name}}
+Terminal=false
+Type=Application
+{{#if mime_type}}
+MimeType={{mime_type}}
+{{/if}}

@@ -1,0 +1,18 @@
+@import "tailwindcss";
+@import "./theme.css";
+
+/* Hover is mouse-only. The kb engine sets data-kb-active on <html> in keyboard
+   mode; redefining the built-in hover variant to require its absence gates every
+   `hover:` utility at once, so content scrolled under a stationary pointer never
+   lights up while the keyboard cursor is the sole indicator. */
+@custom-variant hover (html:not([data-kb-active]) &:hover);
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+}

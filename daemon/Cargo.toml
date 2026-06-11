@@ -1,0 +1,46 @@
+[package]
+name = "magneto-daemon"
+version.workspace = true
+license.workspace = true
+edition = "2024"
+
+# The torrent daemon: librqbit session, streaming, UPnP/DLNA, WebSocket control.
+# Running this binary starts the daemon in the foreground.
+
+[[bin]]
+name = "magneto-daemon"
+path = "src/main.rs"
+
+[dependencies]
+magneto-core = { path = "../core" }
+librqbit = "8.1.1"
+librqbit-upnp-serve = "1.0.1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+axum = { version = "0.8", features = ["ws"] }
+futures-util = { version = "0.3", features = ["sink"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+urlencoding = "2.1"
+rand = "0.9"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+parking_lot = "0.12"
+mime_guess = "2"
+# librqbit-upnp-serve 1.0.1 calls socket2::Socket::set_reuse_port without enabling
+# socket2's `all` feature. Unify the feature here so its v0.5.x dep compiles.
+socket2 = { version = "0.5", features = ["all"] }
+
+[features]
+# Dev-only: a watchdog thread that logs parking_lot lock cycles (covers
+# librqbit's locks too, same crate graph). Run with
+# `cargo run -p magneto-daemon --features deadlock-detection` when chasing a
+# control-plane freeze.
+deadlock-detection = ["parking_lot/deadlock_detection"]
+
+[lints.clippy]
+await_holding_lock = "warn"

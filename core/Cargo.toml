@@ -1,0 +1,21 @@
+[package]
+name = "magneto-core"
+version.workspace = true
+license.workspace = true
+edition = "2024"
+
+# Shared library for daemon lifecycle + wire contract. Linked by the CLI and the
+# Tauri app. Deliberately lean: no librqbit/axum/engine deps.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+anyhow = "1"
+directories = "6"
+tokio = { version = "1", features = ["rt", "macros", "time", "net", "io-util"] }
+tokio-tungstenite = "0.29"
+futures-util = { version = "0.3", features = ["sink"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

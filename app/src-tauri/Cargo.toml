@@ -1,0 +1,42 @@
+[package]
+name = "magneto-app"
+version.workspace = true
+license.workspace = true
+description = "Magneto desktop app"
+edition = "2024"
+
+[lib]
+# The `_lib` suffix keeps the lib name distinct from the bin name (a Windows
+# cargo limitation: https://github.com/rust-lang/cargo/issues/8519).
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-deep-link = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+anyhow = "1"
+base64 = "0.22"
+notify-debouncer-full = "0.7"
+# Bounded wait around the daemon stop that runs as the event loop exits.
+tokio = { version = "1", features = ["time"] }
+
+# Lean shared library: daemon lifecycle (spawn/discover/restart), config paths,
+# and wire types. Does not pull the engine (librqbit/axum) into the app build.
+magneto-core = { path = "../../core" }
+tauri-plugin-clipboard-manager = "2.3.2"
+
+# Desktop-only plugins: focus-existing-window on a second launch, persist/restore
+# window geometry, and launch-at-login. Not available on mobile targets.
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-autostart = "2"

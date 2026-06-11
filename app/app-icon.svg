@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Magneto app icon: source of truth for src-tauri/icons/*.
+       Regenerate with `pnpm icons` (tauri icon) after editing.
+       Colors: dark theme bg #161819, accent green #89b482 (theme.rs).
+       Glyph: lucide "magnet" (24x24 grid), scaled to ~70%
+       (glyph span = 24 * scale; translate = (1024 - span) / 2 keeps it centered).
+       Stroke is fixed at ~62 canvas units independent of glyph scale:
+       stroke-width = 61.875 / scale. -->
+  <rect width="1024" height="1024" rx="230" fill="#161819"/>
+  <rect x="6" y="6" width="1012" height="1012" rx="226" fill="none"
+        stroke="#3f3f3f" stroke-opacity="0.45" stroke-width="10"/>
+  <g transform="translate(152 152) scale(30)" fill="none" stroke="#89b482"
+     stroke-width="2.0625" stroke-linecap="round" stroke-linejoin="round">
+    <path d="m6 15-4-4 6.75-6.77a7.79 7.79 0 0 1 11 11L13 22l-4-4 6.39-6.36a2.14 2.14 0 0 0-3-3L6 15"/>
+    <path d="m5 8 4 4"/>
+    <path d="m12 15 4 4"/>
+  </g>
+</svg>

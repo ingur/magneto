@@ -1,0 +1,110 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # Dry run: builds everything and uploads the bundles as workflow
+  # artifacts, creates no release. Use it to test installers before tagging.
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      # librqbit links openssl (reqwest native-tls + crypto-hash), so the
+      # daemon build needs the headers even in this test job.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+      # Engine crates only: the app crate is webview glue with no Rust tests,
+      # and skipping it keeps webkit system deps out of this job.
+      - run: cargo test -p magneto-core -p magneto-daemon -p magneto-cli
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: app
+      - run: pnpm vitest run
+        working-directory: app
+      - run: pnpm check
+        working-directory: app
+
+  build:
+    needs: test
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 pinned on purpose: the build host sets the glibc and
+          # webkit2gtk-4.1 floor of the produced binaries. When GitHub retires
+          # the label, switch to ubuntu-latest + `container: ubuntu:22.04`
+          # (the bundler handles docker via APPIMAGE_EXTRACT_AND_RUN itself).
+          - platform: ubuntu-22.04
+          - platform: windows-latest
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # libayatana-appindicator3-dev is load-bearing: tray bundling resolves
+      # the appindicator library through pkg-config and panics without it.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libxdo-dev libssl-dev
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - run: pnpm install --frozen-lockfile
+        working-directory: app
+
+      # beforeBuildCommand (tauri.conf.json) cargo-builds and stages the
+      # daemon sidecar, so no separate step is needed. Never pass --target
+      # here: stage-daemon.mjs stages for the rustc host triple.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: app
+          # Tag push: draft release carrying the bundles, named after the
+          # pushed tag itself. Dry run: both empty, the action only builds.
+          # Deliberately NOT v__VERSION__: the action resolves that template
+          # from tauri.conf.json's version (absent here) falling back to
+          # src-tauri's Cargo.toml, which says `version.workspace = true` —
+          # a table, not a string, so the template would resolve to garbage.
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('Magneto {0}', github.ref_name) || '' }}
+          releaseDraft: true
+          prerelease: false
+
+      - name: Upload bundles (dry run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bundles-${{ matrix.platform }}
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/nsis/*.exe

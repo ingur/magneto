@@ -1,0 +1,71 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Magneto",
+  "identifier": "io.github.ingur.magneto",
+  "build": {
+    "beforeDevCommand": "pnpm stage:daemon && pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm stage:daemon:release && pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Magneto",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 600,
+        "minHeight": 400,
+        "decorations": false,
+        "visible": false,
+        "backgroundThrottling": "disabled"
+      }
+    ],
+    "trayIcon": {
+      "id": "main",
+      "iconPath": "icons/icon.png",
+      "tooltip": "Magneto",
+      "showMenuOnLeftClick": true
+    },
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ws://127.0.0.1:* http://127.0.0.1:* ws://localhost:* http://localhost:*; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "rpm", "appimage", "nsis", "app"],
+    "publisher": "ingur",
+    "shortDescription": "A media-focused torrent client.",
+    "externalBin": ["binaries/magneto-daemon"],
+    "fileAssociations": [
+      {
+        "ext": ["torrent"],
+        "name": "BitTorrent",
+        "description": "BitTorrent metadata file",
+        "mimeType": "application/x-bittorrent",
+        "role": "Viewer"
+      }
+    ],
+    "linux": {
+      "deb": { "desktopTemplate": "templates/main.desktop" },
+      "rpm": { "desktopTemplate": "templates/main.desktop" }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["magnet"]
+      }
+    },
+    "opener": {
+      "requireLiteralLeadingDot": false
+    }
+  }
+}

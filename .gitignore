@@ -1,0 +1,22 @@
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
+
+# Rust
+/target
+
+# Test stuff
+tests/harness
+
+# Local agent state
+.claude/
+
+# macOS
+.DS_Store
