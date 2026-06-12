@@ -6,7 +6,7 @@ resolver = "3"
 # the Tauri app/bundle reads it from src-tauri's Cargo.toml (tauri.conf.json
 # declares no version), and daemon/CLI report it through CARGO_PKG_VERSION.
 [workspace.package]
-version = "0.9.2"
+version = "0.9.3"
 license = "GPL-3.0-only"
 
 [profile.release]
