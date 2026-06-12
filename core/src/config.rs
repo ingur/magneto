@@ -109,18 +109,19 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+// All platforms hand the source to a direct-exec opener as a single argv element.
 #[cfg(target_os = "linux")]
 fn default_fallback_app() -> &'static str { "xdg-open" }
 #[cfg(target_os = "macos")]
 fn default_fallback_app() -> &'static str { "open" }
 #[cfg(target_os = "windows")]
-fn default_fallback_app() -> &'static str { "cmd" }
+fn default_fallback_app() -> &'static str { "rundll32.exe" }
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn default_fallback_app() -> &'static str { "" }
 
 #[cfg(target_os = "windows")]
 fn default_fallback_args() -> Vec<String> {
-    vec!["/c".into(), "start".into(), "".into()]
+    vec!["url.dll,FileProtocolHandler".into()]
 }
 #[cfg(not(target_os = "windows"))]
 fn default_fallback_args() -> Vec<String> { Vec::new() }
