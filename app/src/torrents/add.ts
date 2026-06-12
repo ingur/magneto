@@ -4,7 +4,7 @@
 // no-media / fallback toast comes from the event bridge (App.svelte); the add
 // only toasts the synchronous outcomes (already-existed, request error).
 
-import { daemon } from "@/daemon/client.svelte";
+import { ADD_REQUEST_TIMEOUT, daemon } from "@/daemon/client.svelte";
 import type { AddTorrentResp } from "@/daemon/protocol";
 import { pickTorrentFiles, readClipboardText, readTorrentFile } from "@/daemon/tauri";
 import { toast } from "@/lib/feedback/toasts/toasts.svelte";
@@ -26,7 +26,11 @@ export function isTorrentFile(path: string): boolean {
 
 export async function runAddSource(source: string): Promise<void> {
   try {
-    const resp = await daemon.request<AddTorrentResp>("add_torrent", { source });
+    const resp = await daemon.request<AddTorrentResp>(
+      "add_torrent",
+      { source },
+      ADD_REQUEST_TIMEOUT,
+    );
     if (resp.already_existed) toast.info("Already added");
   } catch (e) {
     toast.error(addError(e));

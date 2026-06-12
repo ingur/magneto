@@ -16,6 +16,10 @@ import type {
 export type ConnStatus = "connecting" | "connected" | "reconnecting" | "disconnected";
 
 const REQUEST_TIMEOUT = 15_000;
+// add_torrent defers its reply until librqbit resolves magnet metadata, under
+// a 120s daemon watchdog (ADD_TIMEOUT in commands.rs). Sized above it so the
+// daemon's real success/failure always lands before the client gives up.
+export const ADD_REQUEST_TIMEOUT = 125_000;
 const PING_INTERVAL = 20_000;
 const RECONNECT_BASE = 500;
 const RECONNECT_MAX = 10_000;
@@ -106,7 +110,11 @@ export class DaemonClient {
   }
 
   /** Send a command and resolve with its `result` (or reject on error/timeout). */
-  request<T = unknown>(type: string, payload: unknown = {}): Promise<T> {
+  request<T = unknown>(
+    type: string,
+    payload: unknown = {},
+    timeoutMs = REQUEST_TIMEOUT,
+  ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const ws = this.#ws;
       if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -117,7 +125,7 @@ export class DaemonClient {
       const timer = setTimeout(() => {
         this.#pending.delete(id);
         reject(new Error(`request "${type}" timed out`));
-      }, REQUEST_TIMEOUT);
+      }, timeoutMs);
       this.#pending.set(id, { resolve: resolve as Pending["resolve"], reject, timer });
       ws.send(JSON.stringify({ type, id, payload }));
     });
