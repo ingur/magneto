@@ -6,7 +6,26 @@
 ; those pickers is recorded as the hash-protected per-user default that
 ; survives another torrent client re-claiming the plain class keys.
 
+; Stop a running Magneto before touching files: the app first (its reconnect
+; loop would respawn a killed daemon), then the daemon, which the bundler's
+; own running-app check does not know about and which keeps its exe locked.
+; Kill results are ignored: 2 means already gone, and a partial kill falls
+; through to the bundler's own prompt.
 !macro NSIS_HOOK_PREINSTALL
+  nsis_tauri_utils::FindProcessCurrentUser "${MAINBINARYNAME}.exe"
+  Pop $R0
+  ${If} $R0 = 0
+    nsis_tauri_utils::KillProcessCurrentUser "${MAINBINARYNAME}.exe"
+    Pop $R0
+    Sleep 500
+  ${EndIf}
+  nsis_tauri_utils::FindProcessCurrentUser "magneto-daemon.exe"
+  Pop $R0
+  ${If} $R0 = 0
+    nsis_tauri_utils::KillProcessCurrentUser "magneto-daemon.exe"
+    Pop $R0
+    Sleep 500
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
@@ -29,7 +48,22 @@
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 !macroend
 
+; Uninstall hits the same locks, so stop both processes here too.
 !macro NSIS_HOOK_PREUNINSTALL
+  nsis_tauri_utils::FindProcessCurrentUser "${MAINBINARYNAME}.exe"
+  Pop $R0
+  ${If} $R0 = 0
+    nsis_tauri_utils::KillProcessCurrentUser "${MAINBINARYNAME}.exe"
+    Pop $R0
+    Sleep 500
+  ${EndIf}
+  nsis_tauri_utils::FindProcessCurrentUser "magneto-daemon.exe"
+  Pop $R0
+  ${If} $R0 = 0
+    nsis_tauri_utils::KillProcessCurrentUser "magneto-daemon.exe"
+    Pop $R0
+    Sleep 500
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
