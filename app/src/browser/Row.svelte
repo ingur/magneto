@@ -369,8 +369,15 @@
   {/if}
 
   <div class="h-1 w-full rounded-full bg-muted/20">
+    <!-- 1.1s exceeds the 1s stats cadence so per-tick segments chain without
+         stalling; complete snaps short so finishing reads as an event. Width is
+         set at mount, so first paint takes the true width with no transition. -->
     <div
-      class={["h-full rounded-full", FILL[row.state]]}
+      class={[
+        "h-full rounded-full transition-[width]",
+        row.state === "complete" ? "duration-200 ease-out" : "duration-[1100ms] ease-linear",
+        FILL[row.state],
+      ]}
       style="width: {Math.max(0, Math.min(1, row.progress)) * 100}%"
     ></div>
   </div>

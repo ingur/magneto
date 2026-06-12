@@ -163,8 +163,16 @@ fn build_tick(
         let bytes_threshold =
             (((total_bytes_selected as f64) * BYTES_DELTA_FRACTION).ceil() as u64).max(1);
         let state_changed = last.map(|l| l.state != summary.state).unwrap_or(true);
+        // Downloading bypasses the byte threshold (the client animates between 1s
+        // ticks, so per-tick gains must reach the wire), and a state transition
+        // flushes any suppressed remainder so the bar lands exactly where the new
+        // state says (complete = full). Other states keep threshold quiescence.
         let progress_changed = last
-            .map(|l| summary.downloaded_bytes.abs_diff(l.progress_bytes) >= bytes_threshold)
+            .map(|l| {
+                let diff = summary.downloaded_bytes.abs_diff(l.progress_bytes);
+                diff >= bytes_threshold
+                    || (diff > 0 && (summary.state == TorrentState::Downloading || state_changed))
+            })
             .unwrap_or(true);
         let selected_bytes_changed = last
             .map(|l| l.total_bytes_selected != total_bytes_selected)
@@ -250,7 +258,9 @@ fn build_tick(
                 last.and_then(|l| l.file_progress.get(&f.index).copied()).unwrap_or(0);
             let prev_state = last.and_then(|l| l.file_state.get(&f.index).copied());
             let file_threshold = (((f.size as f64) * BYTES_DELTA_FRACTION).ceil() as u64).max(1);
-            let bytes_changed = f.downloaded_bytes.abs_diff(last_down) >= file_threshold;
+            let diff = f.downloaded_bytes.abs_diff(last_down);
+            let bytes_changed =
+                diff >= file_threshold || (diff > 0 && f.state == FileState::Downloading);
             let state_changed = prev_state != Some(f.state);
             if bytes_changed || state_changed {
                 new_file_progress.insert(f.index, f.downloaded_bytes);
