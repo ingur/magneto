@@ -153,7 +153,9 @@ impl Config {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let text = toml::to_string_pretty(self).context("serializing config")?;
-        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, &text).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("renaming {}", path.display()))
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
