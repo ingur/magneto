@@ -576,7 +576,11 @@ pub async fn cleanup_unpersisted(daemon: &mut Daemon) {
         let any_persisted = entry.files.values().any(|f| f.persisted);
         if !any_persisted {
             if let Err(e) = daemon.session.delete(&hash, true).await {
-                warn!(hash = %short(&hash), error = %e, "cleanup: delete failed");
+                // Likely still resolving and not yet removable; purging its
+                // artifacts now would orphan a live session torrent. Leave it
+                // whole, the next cleanup pass gets it.
+                warn!(hash = %short(&hash), error = %e, "cleanup: delete failed; skipping");
+                continue;
             }
             crate::metadata::delete_torrent_bytes(&daemon.data_dir, &hash);
             crate::daemon::fastresume::delete_fastresume(&daemon.data_dir, &hash);
