@@ -14,8 +14,15 @@ pub fn launch_player(cfg: &PlayerConfig, uris: &[String]) -> Result<()> {
 }
 
 pub fn spawn(command: &str, args: &[String]) -> Result<()> {
+    // Players and fallback handlers are host programs; hand them an
+    // environment scrubbed of AppImage bundle paths (core::spawn_env).
+    // PATH is among the scrubbed values and Command resolves `command`
+    // through the child's PATH, so a bundled tool (like AppImage's own
+    // xdg-open) can't shadow the system one.
     let child = Command::new(command)
         .args(args)
+        .env_clear()
+        .envs(magneto_core::spawn_env::sanitized())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

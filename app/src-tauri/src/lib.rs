@@ -1,3 +1,4 @@
+mod open;
 mod sources;
 mod theme;
 #[cfg(desktop)]
@@ -116,6 +117,8 @@ pub fn run() {
             theme::get_theme,
             read_torrent_file,
             get_config_dir,
+            open::open_path,
+            open::open_url,
             quit_app,
             sources::take_pending_sources
         ])
@@ -124,22 +127,34 @@ pub fn run() {
             #[cfg(desktop)]
             tray::init(app.handle());
 
-            // Register this executable as the magnet handler. Linux: on every
-            // start. Installed registrations only cover the deb/rpm binary,
-            // so this is what makes the AppImage and dev builds handlers at
-            // all (and heals a moved AppImage). Windows: debug builds only;
-            // the installer registers release builds. Off the startup path:
-            // it shells out to xdg-mime/update-desktop-database, and no part
-            // of THIS launch consumes the result.
+            // Register this executable as the magnet handler. Linux: dev
+            // builds and real AppImage runs only. The AppImage runtime sets
+            // $APPIMAGE and the plugin points the written handler at it, so
+            // registration survives the transient mount (and heals a moved
+            // AppImage). Without $APPIMAGE (deb/rpm/nix, or a repackaged
+            // AppImage running from an extraction) current_exe may not be
+            // launchable from outside this process, and the packaged desktop
+            // entry already covers the schemes, so registering would only
+            // hijack mimeapps.list with a broken handler. Windows: debug
+            // builds only; the installer registers release builds. Off the
+            // startup path: it shells out to xdg-mime/update-desktop-database,
+            // and no part of THIS launch consumes the result.
             #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
             {
-                use tauri_plugin_deep_link::DeepLinkExt;
-                let handle = app.handle().clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    if let Err(e) = handle.deep_link().register_all() {
-                        eprintln!("deep-link registration failed: {e}");
-                    }
-                });
+                #[cfg(target_os = "linux")]
+                let register =
+                    cfg!(debug_assertions) || std::env::var_os("APPIMAGE").is_some();
+                #[cfg(windows)]
+                let register = true;
+                if register {
+                    use tauri_plugin_deep_link::DeepLinkExt;
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        if let Err(e) = handle.deep_link().register_all() {
+                            eprintln!("deep-link registration failed: {e}");
+                        }
+                    });
+                }
             }
 
             // Cold start as the OS handler (Windows/Linux): the magnet URI or

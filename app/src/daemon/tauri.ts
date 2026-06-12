@@ -8,7 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
-import { openPath, openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   disable as disableAutostart,
@@ -76,11 +76,12 @@ export async function readTorrentFile(path: string): Promise<string> {
 }
 
 /** Reveal a row's downloaded data in the OS file manager: a file is selected
- *  in its folder; a folder is opened. */
+ *  in its folder; a folder is opened. Folders go through the host's
+ *  open_path command (AppImage-safe spawn, see src-tauri/src/open.rs). */
 export async function revealPath(path: string, kind: PathKind): Promise<void> {
   if (!isTauri()) return;
   if (kind === "file") await revealItemInDir(path);
-  else await openPath(path);
+  else await invoke("open_path", { path });
 }
 
 /** Pick a folder (Settings: downloads directory). Null on cancel / outside Tauri. */
@@ -110,7 +111,7 @@ export async function pickTorrentFiles(): Promise<string[]> {
 /** Open the config directory (config.toml, theme.toml) in the OS file manager. */
 export async function openConfigDir(): Promise<void> {
   if (!isTauri()) return;
-  await openPath(await invoke<string>("get_config_dir"));
+  await invoke("open_path", { path: await invoke<string>("get_config_dir") });
 }
 
 /** Read clipboard text via the plugin; WebKitGTK lets the web clipboard
@@ -134,7 +135,7 @@ export async function setAutostart(on: boolean): Promise<void> {
 
 /** Open an external URL in the OS default browser. No-op outside Tauri. */
 export async function openExternal(url: string): Promise<void> {
-  if (isTauri()) await openUrl(url);
+  if (isTauri()) await invoke("open_url", { url });
 }
 
 /** The app version (from the Tauri bundle). "dev" outside Tauri. */
