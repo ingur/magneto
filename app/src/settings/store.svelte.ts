@@ -65,7 +65,9 @@ class SettingsStore {
         // Fire-and-forget: the reconnect loop rides the restart and refreshes.
         daemon
           .request("restart")
-          .catch(() => toast.warn("Couldn't restart the daemon. Restart it to apply your settings"));
+          .catch(() =>
+            toast.warn("Couldn't restart the daemon. Restart it to apply your settings"),
+          );
       } else {
         toast.success("Settings saved");
       }

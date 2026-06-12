@@ -184,7 +184,13 @@ describe("run* orchestration", () => {
   it("fully-complete leader stays a no-op", async () => {
     const a = torrentId("a");
     const rows = [row(a, { state: "complete", completeCount: 5, fileCount: 5 })];
-    await actions.runToggleDownload({ ids: [a], rows, leader: rows[0], subject: "torrent", bulk: false });
+    await actions.runToggleDownload({
+      ids: [a],
+      rows,
+      leader: rows[0],
+      subject: "torrent",
+      bulk: false,
+    });
     expect(vi.mocked(daemon.request).mock.calls.find((c) => c[0] === "resume")).toBeUndefined();
     expect(vi.mocked(daemon.request).mock.calls.find((c) => c[0] === "pause")).toBeUndefined();
   });

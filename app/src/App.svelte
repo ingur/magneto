@@ -118,7 +118,8 @@
           const ok = await prompt({
             type: "confirm",
             title: "Quit Magneto?",
-            description: "Active downloads and sharing stop.\nClosing the window keeps them running.",
+            description:
+              "Active downloads and sharing stop.\nClosing the window keeps them running.",
             confirmLabel: "Quit",
             tint: "danger",
           });
