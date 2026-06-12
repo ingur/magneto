@@ -53,6 +53,7 @@ afterEach(() => {
 
 const RECONNECT_MAX = 10_000;
 const CONNECT_TIMEOUT = 10_000;
+const PING_INTERVAL = 20_000;
 
 describe("DaemonClient recovery", () => {
   it("keeps retrying when the port resolver rejects (daemon down at launch)", async () => {
@@ -138,6 +139,10 @@ describe("DaemonClient recovery", () => {
     client.connect(resolve);
     await vi.advanceTimersByTimeAsync(0);
     expect(MockSocket.instances).toHaveLength(1);
+
+    // And it must not kill the keepalive ping of the live socket either.
+    await vi.advanceTimersByTimeAsync(PING_INTERVAL);
+    expect(MockSocket.instances[0].sent.some((m) => m.includes('"type":"ping"'))).toBe(true);
   });
 
   it("dials the token onto the control URL when the resolver supplies one", async () => {

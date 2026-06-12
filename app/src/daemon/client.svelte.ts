@@ -93,6 +93,10 @@ export class DaemonClient {
    */
   connect(resolve: () => Promise<ControlEndpoint>): void {
     this.#resolve = resolve;
+    // Already live: keep the socket and its ping, refresh only the resolver
+    // for future redials. Clearing timers here would kill the keepalive while
+    // #open() declines to dial over an open socket.
+    if (this.#ws?.readyState === WebSocket.OPEN) return;
     this.#intentional = false;
     this.#attempts = 0;
     // Cancel any reconnect left over from a prior lifecycle so this dial can't
