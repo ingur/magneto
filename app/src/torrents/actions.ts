@@ -35,21 +35,34 @@ export interface ActionTargets {
   bulk: boolean;
 }
 
+// The marked rows in the order they appear on screen, so bulk actions (notably
+// play, which becomes a playlist) follow the visible list top to bottom rather
+// than the order rows were toggled. Selected ids not in the current view (a
+// committed filter scrolled them out) are appended in selection order so no
+// target is silently dropped.
+export function orderBySelection(rows: Row[], selection: ReadonlySet<string>): string[] {
+  const inOrder = rows.filter((r) => selection.has(r.id)).map((r) => r.id);
+  if (inOrder.length === selection.size) return inOrder;
+  const seen = new Set(inOrder);
+  return [...inOrder, ...[...selection].filter((id) => !seen.has(id))];
+}
+
 // Keyboard targeting: the marked selection if any, else the cursored row.
 export function resolveTargets(): ActionTargets {
   const rows = nav.currentRows;
   const cursorRow = rows.find((r) => r.id === kb.cursor());
   const bulk = nav.selection.size > 0;
-  const ids = bulk ? [...nav.selection] : cursorRow ? [cursorRow.id] : [];
+  const ids = bulk ? orderBySelection(rows, nav.selection) : cursorRow ? [cursorRow.id] : [];
   return { ids, rows, leader: cursorRow, subject: subjectFor(ids, cursorRow), bulk };
 }
 
 // Row targeting (mouse): the selection if this row is part of it, else just
 // this row. The clicked row is always the leader.
 export function rowTargets(row: Row, marked: boolean): ActionTargets {
+  const rows = nav.currentRows;
   const bulk = marked && nav.selection.size > 0;
-  const ids = bulk ? [...nav.selection] : [row.id];
-  return { ids, rows: nav.currentRows, leader: row, subject: subjectFor(ids, row), bulk };
+  const ids = bulk ? orderBySelection(rows, nav.selection) : [row.id];
+  return { ids, rows, leader: row, subject: subjectFor(ids, row), bulk };
 }
 
 function subjectFor(ids: string[], leader: Row | undefined): string {

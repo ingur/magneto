@@ -74,6 +74,20 @@ describe("targeting + bulk flag", () => {
   });
 });
 
+describe("orderBySelection", () => {
+  it("returns marked rows in display order, not toggle order", () => {
+    const rows = [row("a"), row("b"), row("c")];
+    const sel = new Set(["c", "a"]); // toggled c then a
+    expect(actions.orderBySelection(rows, sel)).toEqual(["a", "c"]);
+  });
+
+  it("appends selected ids not in the current view (filtered out) in selection order", () => {
+    const rows = [row("a"), row("b")];
+    const sel = new Set(["b", "z", "a"]); // z is off-screen
+    expect(actions.orderBySelection(rows, sel)).toEqual(["a", "b", "z"]);
+  });
+});
+
 describe("run* orchestration", () => {
   it("keeps the selection after non-destructive bulk actions (chaining)", async () => {
     const [a, b, c] = [torrentId("a"), torrentId("b"), torrentId("c")];

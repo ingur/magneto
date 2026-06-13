@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -1194,8 +1194,7 @@ fn group_targets(
     daemon: &Daemon,
     targets: &[Target],
 ) -> Result<Vec<(String, Vec<u32>)>, String> {
-    let mut by_hash: std::collections::BTreeMap<String, Vec<u32>> =
-        std::collections::BTreeMap::new();
+    let mut pairs: Vec<(String, Vec<u32>)> = Vec::new();
     for target in targets {
         let info_hash = target.info_hash().to_string();
         let media = media_indices(&daemon.metadata, &info_hash);
@@ -1240,13 +1239,42 @@ fn group_targets(
         // media) must not create an empty group. That would suppress the
         // "does not resolve" error below and report a silent success.
         if !expanded.is_empty() {
-            by_hash.entry(info_hash).or_default().extend(expanded);
+            pairs.push((info_hash, expanded));
         }
     }
-    if by_hash.is_empty() && !targets.is_empty() {
+    let groups = merge_target_groups(pairs);
+    if groups.is_empty() && !targets.is_empty() {
         return Err("targets do not resolve to any media file".into());
     }
-    Ok(by_hash.into_iter().collect())
+    Ok(groups)
+}
+
+/// Collapse per-target (info_hash, indices) pairs into one group per torrent.
+/// Torrents keep first-seen order across the list, and indices keep first-seen
+/// order within each torrent, so the resulting sequence follows the order the
+/// targets arrived in. A repeated index (a whole torrent plus one of its files)
+/// collapses to its first occurrence.
+fn merge_target_groups(pairs: Vec<(String, Vec<u32>)>) -> Vec<(String, Vec<u32>)> {
+    let mut groups: Vec<(String, Vec<u32>)> = Vec::new();
+    let mut slot: HashMap<String, usize> = HashMap::new();
+    for (info_hash, indices) in pairs {
+        let i = match slot.get(&info_hash) {
+            Some(&i) => i,
+            None => {
+                let i = groups.len();
+                slot.insert(info_hash.clone(), i);
+                groups.push((info_hash, Vec::new()));
+                i
+            }
+        };
+        let bucket = &mut groups[i].1;
+        for idx in indices {
+            if !bucket.contains(&idx) {
+                bucket.push(idx);
+            }
+        }
+    }
+    groups
 }
 
 fn media_indices(metadata: &RwLock<MetadataStore>, info_hash: &str) -> Vec<u32> {
@@ -1841,6 +1869,24 @@ mod tests {
         ];
         let recent = HashSet::from([0, 1]);
         assert_eq!(active_indices(&files, Some(&recent)), HashSet::from([2]));
+    }
+
+    #[test]
+    fn merge_target_groups_preserves_first_seen_order_across_torrents() {
+        // Arrival order, not the sorted-by-hash order a BTreeMap would impose.
+        let pairs = vec![
+            ("c".to_string(), vec![0]),
+            ("a".to_string(), vec![0]),
+            ("b".to_string(), vec![0]),
+        ];
+        let hashes: Vec<String> = merge_target_groups(pairs).into_iter().map(|(h, _)| h).collect();
+        assert_eq!(hashes, ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn merge_target_groups_dedups_indices_keeping_first_order() {
+        let pairs = vec![("a".to_string(), vec![2, 0, 1]), ("a".to_string(), vec![1, 3])];
+        assert_eq!(merge_target_groups(pairs), vec![("a".to_string(), vec![2, 0, 1, 3])]);
     }
 
     #[test]

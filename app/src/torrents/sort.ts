@@ -27,9 +27,9 @@ export function sortRows(rows: Row[], mode: SortMode): Row[] {
       if (!rows.some((r) => r.addedAt)) return rows;
       return [...rows].sort((a, b) => (b.addedAt ?? "").localeCompare(a.addedAt ?? ""));
     case "name-asc":
-      return [...rows].sort((a, b) => a.name.localeCompare(b.name));
+      return [...rows].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
     case "name-desc":
-      return [...rows].sort((a, b) => b.name.localeCompare(a.name));
+      return [...rows].sort((a, b) => b.name.localeCompare(a.name, undefined, { numeric: true }));
     case "size-desc":
       return [...rows].sort((a, b) => b.size - a.size);
     case "size-asc":

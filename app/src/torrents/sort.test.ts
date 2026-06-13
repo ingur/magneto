@@ -33,6 +33,19 @@ describe("sortRows", () => {
     expect(names(sortRows(rows, "name-desc"))).toEqual(["Charlie", "Bravo", "alpha"]);
   });
 
+  it("orders embedded numbers naturally (episode 2 before episode 10)", () => {
+    const eps = [
+      row({ name: "Show Episode 10" }),
+      row({ name: "Show Episode 2" }),
+      row({ name: "Show Episode 1" }),
+    ];
+    expect(names(sortRows(eps, "name-asc"))).toEqual([
+      "Show Episode 1",
+      "Show Episode 2",
+      "Show Episode 10",
+    ]);
+  });
+
   it("sorts by size", () => {
     expect(names(sortRows(rows, "size-desc"))).toEqual(["Bravo", "Charlie", "alpha"]);
     expect(names(sortRows(rows, "size-asc"))).toEqual(["alpha", "Charlie", "Bravo"]);
