@@ -62,7 +62,7 @@ impl Default for Config {
                 auto_download: true,
                 persist_by_default: false,
                 share_by_default: false,
-                autoplay: true,
+                autoplay: false,
             },
             media: MediaConfig {
                 extensions: vec![
