@@ -5,11 +5,12 @@
 // spawning or if the webview reloads. Drained on every sources-ready ping
 // and on every snapshot (each (re)connect emits one, which also covers any
 // ping that fires before the listener is registered), then routed through
-// the normal add flow.
+// the normal add flow. A source the daemon did not take goes back to the
+// host queue for the next drain instead of surviving only as a toast.
 
 import { daemon } from "@/daemon/client.svelte";
-import { onSourcesReady, takePendingSources } from "@/daemon/tauri";
-import { isAddSource, runAddPaths, runAddSource } from "./add";
+import { onSourcesReady, requeueSources, takePendingSources } from "@/daemon/tauri";
+import { isAddSource, runAddPath, runAddSource } from "./add";
 
 /** Start draining host-queued sources. Returns the unsubscriber. */
 export function initIntake(): () => void {
@@ -26,10 +27,10 @@ export function initIntake(): () => void {
 async function drain(): Promise<void> {
   if (daemon.status !== "connected") return;
   const sources = await takePendingSources();
-  const paths: string[] = [];
+  const failed: string[] = [];
   for (const source of sources) {
-    if (isAddSource(source)) await runAddSource(source);
-    else paths.push(source);
+    const ok = await (isAddSource(source) ? runAddSource(source) : runAddPath(source));
+    if (!ok) failed.push(source);
   }
-  if (paths.length > 0) await runAddPaths(paths);
+  if (failed.length > 0) await requeueSources(failed);
 }

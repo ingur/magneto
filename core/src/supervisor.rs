@@ -393,7 +393,14 @@ async fn ping(port: u16, token: Option<&str>) -> bool {
 }
 
 async fn client_call(port: u16, command: &str, token: Option<&str>) -> Result<serde_json::Value> {
-    crate::client::run_raw(port, command, serde_json::json!({}), token).await
+    crate::client::run_raw(
+        port,
+        command,
+        serde_json::json!({}),
+        token,
+        crate::client::REQUEST_TIMEOUT,
+    )
+    .await
 }
 
 fn desired_port() -> Result<u16> {

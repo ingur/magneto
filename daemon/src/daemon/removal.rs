@@ -88,7 +88,7 @@ pub async fn remove(
 pub fn reclaim(handle: &TorrentHandle, indices: &[u32], download_dir: &Path) {
     let mut dirs: Vec<PathBuf> = Vec::new();
     for idx in indices {
-        let Some(path) = file_local_path(handle, *idx as usize, download_dir) else {
+        let Some(path) = file_local_path(handle, *idx as usize) else {
             continue;
         };
         if !path.exists() {
@@ -138,7 +138,7 @@ fn managed_indices(daemon: &Daemon, handle: &TorrentHandle, info_hash: &str) -> 
             (0..m.file_infos.len() as u32)
                 .filter(|i| !managed.contains(i))
                 .filter(|i| {
-                    file_local_path(handle, *i as usize, &daemon.started.downloads.dir)
+                    file_local_path(handle, *i as usize)
                         .and_then(|p| std::fs::metadata(p).ok())
                         .is_some_and(|m| m.len() == 0)
                 })

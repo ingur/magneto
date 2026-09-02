@@ -24,7 +24,17 @@ export function isTorrentFile(path: string): boolean {
   return name.endsWith(".torrent") && name !== ".torrent";
 }
 
-export async function runAddSource(source: string): Promise<void> {
+/** Whether a failed add counts as dealt with. A verdict from the daemon will
+ *  not change on the next drain, so only a lost request is worth handing back
+ *  to the queue. */
+export function addFailureHandled(message: string): boolean {
+  return message !== "daemon not connected" && message !== "connection closed";
+}
+
+/** Send one add. True once the daemon has taken the source (added, or already
+ *  known); false when the request itself failed, so a queued source can be
+ *  retried rather than lost. */
+export async function runAddSource(source: string): Promise<boolean> {
   try {
     const resp = await daemon.request<AddTorrentResp>(
       "add_torrent",
@@ -32,8 +42,10 @@ export async function runAddSource(source: string): Promise<void> {
       ADD_REQUEST_TIMEOUT,
     );
     if (resp.already_existed) toast.info("Already added");
+    return true;
   } catch (e) {
     toast.error(addError(e));
+    return addFailureHandled(e instanceof Error ? e.message : String(e));
   }
 }
 
@@ -64,13 +76,7 @@ export async function runAddPicked(): Promise<void> {
 /** Drop path: add every `.torrent`, toast the rest. */
 export async function runAddPaths(paths: string[]): Promise<void> {
   const torrents = paths.filter(isTorrentFile);
-  for (const path of torrents) {
-    try {
-      await runAddSource(await readTorrentFile(path));
-    } catch {
-      toast.error(`Couldn't read ${basename(path)}`);
-    }
-  }
+  for (const path of torrents) await runAddPath(path);
   const rejected = paths.length - torrents.length;
   if (rejected > 0) {
     toast.error(
@@ -79,6 +85,19 @@ export async function runAddPaths(paths: string[]): Promise<void> {
         : `${rejected} non-.torrent file${rejected === 1 ? "" : "s"} skipped`,
     );
   }
+}
+
+/** Read one `.torrent` and add it. An unreadable file is reported and counts
+ *  as handled (a retry cannot fix it); only the daemon's answer decides. */
+export async function runAddPath(path: string): Promise<boolean> {
+  let source: string;
+  try {
+    source = await readTorrentFile(path);
+  } catch {
+    toast.error(`Couldn't read ${basename(path)}`);
+    return true;
+  }
+  return runAddSource(source);
 }
 
 function addError(e: unknown): string {

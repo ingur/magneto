@@ -28,15 +28,14 @@ pub struct Pending {
 /// with no check running, so this keeps waiting: resuming restarts it, and
 /// finalizing then is exactly right.
 ///
-/// Calling this again for a torrent already being waited on only sharpens the
-/// pending decision, so a re-add during a boot check still applies the add
-/// policy.
+/// Calling this again for a torrent already being waited on replaces the
+/// decision only with a more deliberate one, so a re-add during a boot check
+/// applies the add policy and does not inherit the boot's pause intent.
 pub fn spawn(daemon: &mut Daemon, info_hash: &str, from: Finalize, repause: bool) {
     if let Some(pending) = daemon.checks.get_mut(info_hash) {
-        if from == Finalize::Add {
-            pending.from = Finalize::Add;
+        if deliberateness(from) > deliberateness(pending.from) {
+            *pending = Pending { from, repause };
         }
-        pending.repause |= repause;
         return;
     }
     daemon.checks.insert(info_hash.to_string(), Pending { from, repause });
@@ -63,4 +62,13 @@ pub fn spawn(daemon: &mut Daemon, info_hash: &str, from: Finalize, repause: bool
         }
         let _ = inbox.send(DaemonEvent::CheckFinished { info_hash }).await;
     });
+}
+
+/// The user asking beats startup, which beats the engine's own state.
+fn deliberateness(from: Finalize) -> u8 {
+    match from {
+        Finalize::Restore => 0,
+        Finalize::Boot => 1,
+        Finalize::Add => 2,
+    }
 }

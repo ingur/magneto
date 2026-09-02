@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { isAddSource, isTorrentFile } from "./add";
+import { addFailureHandled, isAddSource, isTorrentFile } from "./add";
 
 describe("add source validation", () => {
   it("accepts magnets and http(s) urls (trimmed, case-insensitive)", () => {
@@ -26,5 +26,18 @@ describe("add source validation", () => {
     expect(isTorrentFile("/tmp/.torrent")).toBe(false);
     expect(isTorrentFile(".torrent")).toBe(false);
     expect(isTorrentFile("/tmp/.foo.torrent")).toBe(true);
+  });
+});
+
+describe("failed add disposition", () => {
+  it("hands a lost request back to the queue", () => {
+    expect(addFailureHandled("daemon not connected")).toBe(false);
+    expect(addFailureHandled("connection closed")).toBe(false);
+  });
+
+  it("keeps a daemon verdict out of the queue", () => {
+    expect(addFailureHandled("add_torrent failed: metadata not resolved within 120s")).toBe(true);
+    expect(addFailureHandled("invalid base64 torrent bytes: bad")).toBe(true);
+    expect(addFailureHandled("could not record torrent: disk full")).toBe(true);
   });
 });

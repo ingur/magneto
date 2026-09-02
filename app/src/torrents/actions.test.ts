@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { daemon } from "@/daemon/client.svelte";
-import type { TorrentSummary } from "@/daemon/protocol";
+import type { Outbound, TorrentSummary } from "@/daemon/protocol";
 import { toast } from "@/lib/feedback/toasts/toasts.svelte";
 
 import * as actions from "./actions";
@@ -25,9 +25,35 @@ function row(id: string, over: Partial<Row> = {}): Row {
   };
 }
 
+function summary(over: Partial<TorrentSummary> = {}): TorrentSummary {
+  return {
+    info_hash: "abc",
+    name: "Movie",
+    source: "",
+    source_kind: "url",
+    state: "complete",
+    error: null,
+    check_progress: null,
+    total_bytes_all: 0,
+    total_bytes_selected: 0,
+    downloaded_bytes: 0,
+    download_speed: 0,
+    upload_speed: 0,
+    file_count: 1,
+    complete_count: 1,
+    selected_count: 1,
+    persisted_count: 0,
+    shared_count: 0,
+    is_paused: false,
+    added_at: "",
+    ...over,
+  };
+}
+
 beforeEach(() => {
   nav.pathIds = [];
   nav.clearSelection();
+  daemon.torrents = {};
   vi.spyOn(daemon, "request").mockResolvedValue({} as never);
   vi.spyOn(toast, "info").mockReturnValue(0);
   vi.spyOn(toast, "success").mockReturnValue(0);
@@ -61,13 +87,23 @@ describe("targeting + bulk flag", () => {
   });
 
   it("resolveTargets marks a selection as bulk", () => {
-    nav.markAll(["A", "B"]);
+    daemon.torrents = { a: summary({ info_hash: "a" }), b: summary({ info_hash: "b" }) };
+    nav.markAll([torrentId("a"), torrentId("b")]);
     const t = actions.resolveTargets();
-    expect(new Set(t.ids)).toEqual(new Set(["A", "B"]));
+    expect(new Set(t.ids)).toEqual(new Set([torrentId("a"), torrentId("b")]));
     expect(t.bulk).toBe(true);
   });
 
   it("resolveTargets with no selection and no cursor is empty, not bulk", () => {
+    const t = actions.resolveTargets();
+    expect(t.ids).toEqual([]);
+    expect(t.bulk).toBe(false);
+  });
+
+  it("resolveTargets targets nothing while the marked rows are not rendered", () => {
+    // Marks survive a reconnect while the open torrent's detail is refetched;
+    // until its rows are back there is nothing on screen to act on.
+    nav.markAll([torrentId("a"), torrentId("b")]);
     const t = actions.resolveTargets();
     expect(t.ids).toEqual([]);
     expect(t.bulk).toBe(false);
@@ -231,8 +267,8 @@ describe("run* orchestration", () => {
   });
 });
 
-describe("ready gate", () => {
-  it("gates file targets of a not-ready torrent and warns instead of a silent no-op", async () => {
+describe("no client-side readiness gate", () => {
+  it("sends a file target of a torrent whose detail was never fetched", async () => {
     const f = fileId("x", 0);
     await actions.runPlay({
       ids: [f],
@@ -241,36 +277,71 @@ describe("ready gate", () => {
       subject: "file",
       bulk: false,
     });
-    expect(daemon.request).not.toHaveBeenCalled();
-    expect(toast.warn).toHaveBeenCalled();
+    expect(daemon.request).toHaveBeenCalledWith("play", {
+      targets: [{ kind: "file", info_hash: "x", file_index: 0 }],
+    });
+    expect(toast.warn).not.toHaveBeenCalled();
+  });
+
+  it("a torrent seen initializing in the snapshot is actionable once a delta completes it", async () => {
+    // The wire path matters here: the snapshot lands the summary, the delta
+    // patches it, and the action must read the patched state.
+    class StubSocket {
+      static last: StubSocket | null = null;
+      static readonly OPEN = 1;
+      static readonly CLOSED = 3;
+      readyState = 0;
+      onopen: (() => void) | null = null;
+      onmessage: ((ev: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor() {
+        StubSocket.last = this;
+      }
+      send() {}
+      close() {}
+    }
+    vi.stubGlobal("WebSocket", StubSocket);
+    vi.useFakeTimers();
+    daemon.connect(async () => ({ port: 1, token: null }));
+    await vi.advanceTimersByTimeAsync(0); // let the endpoint resolve and the dial happen
+    const ws = StubSocket.last!;
+    ws.readyState = 1;
+    ws.onopen!();
+    const deliver = (msg: Outbound) => ws.onmessage!({ data: JSON.stringify(msg) });
+    try {
+      deliver({
+        type: "snapshot",
+        daemon: {} as never,
+        config: {} as never,
+        torrents: [summary({ info_hash: "x", state: "initializing", check_progress: 0.4 })],
+      });
+      deliver({
+        type: "stats",
+        torrents: [{ info_hash: "x", state: "complete", check_progress: null }],
+        files: [],
+      });
+      expect(daemon.torrents.x.state).toBe("complete");
+
+      const f = fileId("x", 0);
+      await actions.runPlay({
+        ids: [f],
+        rows: [],
+        leader: row(f, { kind: "file" }),
+        subject: "file",
+        bulk: false,
+      });
+      expect(daemon.request).toHaveBeenCalledWith("play", {
+        targets: [{ kind: "file", info_hash: "x", file_index: 0 }],
+      });
+    } finally {
+      daemon.disconnect();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
   });
 });
 
 describe("buildMagnet", () => {
-  const summary = (over: Partial<TorrentSummary>): TorrentSummary => ({
-    info_hash: "abc",
-    name: "Movie",
-    source: null,
-    source_kind: null,
-    state: "complete",
-    total_bytes_all: 0,
-    total_bytes_selected: 0,
-    downloaded_bytes: 0,
-    download_speed: 0,
-    upload_speed: 0,
-    file_count: 1,
-    complete_count: 1,
-    selected_count: 1,
-    persisted_count: 0,
-    shared_count: 0,
-    is_initializing: false,
-    is_complete: true,
-    is_seeding: false,
-    is_paused: false,
-    added_at: "",
-    ...over,
-  });
-
   it("reuses the original magnet (trackers and all)", () => {
     const s = summary({ source_kind: "magnet", source: "magnet:?xt=urn:btih:xyz&tr=udp://t" });
     expect(actions.buildMagnet(s)).toBe("magnet:?xt=urn:btih:xyz&tr=udp://t");

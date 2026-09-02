@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { daemon } from "@/daemon/client.svelte";
   import { nav } from "@/torrents/nav.svelte";
   import StatusItem from "@/lib/status/StatusItem.svelte";
 
@@ -13,9 +14,14 @@
     if (rows.every((r) => r.kind === "file")) return "files";
     return "items";
   });
-  const downloading = $derived(rows.filter((r) => r.state === "downloading").length);
-  // Seeding from the structured is_seeding signal (torrent rows only; there
-  // is no per-file seeding flag on the wire).
+  // Activity counts are live claims: hidden while the socket is down rather
+  // than frozen at their last reading. Stalled is downloading that receives
+  // nothing, so it counts.
+  const live = $derived(daemon.status === "connected");
+  const downloading = $derived(
+    rows.filter((r) => r.state === "downloading" || r.state === "stalled").length,
+  );
+  // Seeding is a torrent-row fact (there is no per-file seeding on the wire).
   const seeding = $derived(rows.filter((r) => r.kind === "torrent" && r.isSeeding).length);
 
   function selectAllVisible() {

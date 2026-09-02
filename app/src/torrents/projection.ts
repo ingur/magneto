@@ -12,6 +12,7 @@ import type {
   TorrentState,
   TorrentSummary,
 } from "@/daemon/protocol";
+import { isComplete, isInitializing, isSeeding } from "@/daemon/summary";
 import { fileId, folderId, torrentId, type RowKind } from "./ids";
 
 // Aggregate persist/share state for rows that stand for many files.
@@ -38,6 +39,9 @@ export interface Row {
   uploadSpeed?: number; // bytes/sec
   isSeeding?: boolean;
   isPaused?: boolean; // engine-level pause (file rows carry it as state)
+  resolving?: boolean; // metadata not in yet: no name, no files
+  checkProgress?: number; // 0..1 while the engine checks files
+  error?: string; // why the torrent is in the error state
   addedAt?: string;
   remaining?: number; // bytes left of the selected set (drives ETA)
   // aggregate rows (torrent + folder)
@@ -131,9 +135,12 @@ function torrentRow(t: TorrentSummary): Row {
     kind: "torrent",
     name: t.name ?? shortHash(t.info_hash),
     state: t.state,
-    progress:
-      t.total_bytes_selected === 0
-        ? t.is_complete
+    // While the engine checks files the bar tracks the check; download
+    // progress would sit at a meaningless 0 until it finishes.
+    progress: isInitializing(t)
+      ? (t.check_progress ?? 0)
+      : t.total_bytes_selected === 0
+        ? isComplete(t)
           ? 1
           : 0
         : clamp01(t.downloaded_bytes / t.total_bytes_selected),
@@ -149,8 +156,11 @@ function torrentRow(t: TorrentSummary): Row {
     mixed: false, // per-state file counts aren't on the summary
     downloadSpeed: t.download_speed,
     uploadSpeed: t.upload_speed,
-    isSeeding: t.is_seeding,
+    isSeeding: isSeeding(t),
     isPaused: t.is_paused,
+    resolving: isInitializing(t) && t.name === null,
+    checkProgress: t.check_progress ?? undefined,
+    error: t.error ?? undefined,
     addedAt: t.added_at,
     remaining: Math.max(0, t.total_bytes_selected - t.downloaded_bytes),
     fileCount: t.file_count,

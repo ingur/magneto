@@ -83,6 +83,7 @@ impl Target {
 pub enum TorrentState {
     Initializing,
     Downloading,
+    Stalled,
     Paused,
     Idle,
     Complete,
@@ -108,15 +109,21 @@ pub enum SourceKind {
     File,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Nothing here is derived from another field: a derived field goes stale as
+// soon as a delta refreshes only part of the summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TorrentSummary {
     pub info_hash: InfoHash,
     pub name: Option<String>,
-    // Original add source + kind, for copy-source / re-add. None until metadata is
-    // recorded; for file kind, source is a local .torrent path.
-    pub source: Option<String>,
-    pub source_kind: Option<SourceKind>,
+    // Original add source + kind, for copy-source / re-add. For file kind,
+    // source is a local .torrent path.
+    pub source: String,
+    pub source_kind: SourceKind,
     pub state: TorrentState,
+    // First line of why the engine gave up.
+    pub error: Option<String>,
+    // 0.0 to 1.0 through the file check, while initializing.
+    pub check_progress: Option<f64>,
     // Byte fields are bytes; download_speed/upload_speed are BYTES PER SECOND.
     // total_bytes_all sums all managed (media) files; total_bytes_selected is the
     // selected-for-download subset and is the progress denominator.
@@ -130,9 +137,6 @@ pub struct TorrentSummary {
     pub selected_count: u32,
     pub persisted_count: u32,
     pub shared_count: u32,
-    pub is_initializing: bool,
-    pub is_complete: bool,
-    pub is_seeding: bool,
     pub is_paused: bool,
     pub added_at: String,
 }
@@ -175,6 +179,7 @@ pub struct DaemonInfo {
     pub upnp_active: bool,
     // Restart-required fields whose saved value differs from the running process.
     pub pending_restart: Vec<String>,
+    pub started_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -189,23 +194,35 @@ impl StatsEvent {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+// Every summary field, omitted when unchanged. Clients merge a patch over the
+// summary they hold, so a field this cannot carry is a field that can go stale.
+#[derive(Debug, Clone, Serialize, Default, PartialEq)]
 pub struct TorrentStatsDelta {
     pub info_hash: InfoHash,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<SourceKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<TorrentState>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub downloaded_bytes: Option<u64>,
+    pub error: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_progress: Option<Option<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes_all: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_bytes_selected: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub downloaded_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub download_speed: Option<f64>, // bytes per second
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upload_speed: Option<f64>, // bytes per second
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_paused: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_seeding: Option<bool>,
+    pub file_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub complete_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,6 +231,59 @@ pub struct TorrentStatsDelta {
     pub persisted_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_paused: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<String>,
+}
+
+impl TorrentStatsDelta {
+    pub fn new(info_hash: InfoHash) -> Self {
+        Self { info_hash, ..Default::default() }
+    }
+
+    /// Whether this patch says anything beyond naming the torrent.
+    pub fn is_empty(&self) -> bool {
+        let Self {
+            info_hash: _,
+            name,
+            source,
+            source_kind,
+            state,
+            error,
+            check_progress,
+            total_bytes_all,
+            total_bytes_selected,
+            downloaded_bytes,
+            download_speed,
+            upload_speed,
+            file_count,
+            complete_count,
+            selected_count,
+            persisted_count,
+            shared_count,
+            is_paused,
+            added_at,
+        } = self;
+        name.is_none()
+            && source.is_none()
+            && source_kind.is_none()
+            && state.is_none()
+            && error.is_none()
+            && check_progress.is_none()
+            && total_bytes_all.is_none()
+            && total_bytes_selected.is_none()
+            && downloaded_bytes.is_none()
+            && download_speed.is_none()
+            && upload_speed.is_none()
+            && file_count.is_none()
+            && complete_count.is_none()
+            && selected_count.is_none()
+            && persisted_count.is_none()
+            && shared_count.is_none()
+            && is_paused.is_none()
+            && added_at.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,9 +296,8 @@ pub struct FileStatsDelta {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TorrentAddedEvent {
-    pub info_hash: InfoHash,
-    pub source: String,
-    pub state: TorrentState,
+    #[serde(flatten)]
+    pub summary: TorrentSummary,
     pub already_existed: bool,
 }
 
@@ -442,32 +511,45 @@ mod tests {
     }
 
     #[test]
+    fn torrent_added_event_is_flat_not_summary_wrapped() {
+        let out = Outbound::TorrentAdded(TorrentAddedEvent {
+            summary: sample_summary(),
+            already_existed: true,
+        });
+        let obj = json_obj(&out);
+        assert_eq!(obj.get("type").unwrap(), "torrent_added");
+        assert_eq!(obj.get("info_hash").unwrap(), "abc");
+        assert_eq!(obj.get("already_existed").unwrap(), true);
+        assert!(!obj.contains_key("summary"));
+    }
+
+    fn sample_summary() -> TorrentSummary {
+        TorrentSummary {
+            info_hash: "abc".into(),
+            name: Some("movie".into()),
+            source: "magnet:?xt=urn:btih:abc".into(),
+            source_kind: SourceKind::Magnet,
+            state: TorrentState::Complete,
+            error: None,
+            check_progress: None,
+            total_bytes_all: 0,
+            total_bytes_selected: 0,
+            downloaded_bytes: 0,
+            download_speed: 0.0,
+            upload_speed: 0.0,
+            file_count: 0,
+            complete_count: 0,
+            selected_count: 0,
+            persisted_count: 0,
+            shared_count: 0,
+            is_paused: false,
+            added_at: "2026-06-05T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
     fn torrent_ready_event_is_flat_not_payload_wrapped() {
-        let detail = TorrentDetail {
-            summary: TorrentSummary {
-                info_hash: "abc".into(),
-                name: Some("movie".into()),
-                source: None,
-                source_kind: None,
-                state: TorrentState::Complete,
-                total_bytes_all: 0,
-                total_bytes_selected: 0,
-                downloaded_bytes: 0,
-                download_speed: 0.0,
-                upload_speed: 0.0,
-                file_count: 0,
-                complete_count: 0,
-                selected_count: 0,
-                persisted_count: 0,
-                shared_count: 0,
-                is_initializing: false,
-                is_complete: true,
-                is_seeding: false,
-                is_paused: false,
-                added_at: "2026-06-05T00:00:00Z".into(),
-            },
-            files: vec![],
-        };
+        let detail = TorrentDetail { summary: sample_summary(), files: vec![] };
         let obj = json_obj(&Outbound::TorrentReady(detail));
         assert_eq!(obj.get("type").unwrap(), "torrent_ready");
         assert_eq!(obj.get("info_hash").unwrap(), "abc");

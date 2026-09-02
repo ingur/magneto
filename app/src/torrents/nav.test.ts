@@ -1,18 +1,21 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushSync } from "svelte";
 
 import { daemon } from "@/daemon/client.svelte";
 import type { TorrentSummary } from "@/daemon/protocol";
+import { data } from "./data.svelte";
 import { nav } from "./nav.svelte";
-import { torrentId } from "./ids";
+import { fileId, torrentId } from "./ids";
 
 function torrentSummary(info_hash: string, name: string): TorrentSummary {
   return {
     info_hash,
     name,
-    source: null,
-    source_kind: null,
+    source: "",
+    source_kind: "magnet",
     state: "downloading",
+    error: null,
+    check_progress: null,
     total_bytes_all: 100,
     total_bytes_selected: 100,
     downloaded_bytes: 50,
@@ -23,9 +26,6 @@ function torrentSummary(info_hash: string, name: string): TorrentSummary {
     selected_count: 1,
     persisted_count: 0,
     shared_count: 0,
-    is_initializing: false,
-    is_complete: false,
-    is_seeding: false,
     is_paused: false,
     added_at: "2026-06-01T00:00:00Z",
   };
@@ -208,5 +208,39 @@ describe("filter selection scope", () => {
     nav.pruneStaleMarks();
     expect(nav.isMarked(torrentId("b"))).toBe(false);
     expect(nav.isMarked(torrentId("a"))).toBe(true);
+  });
+});
+
+describe("marks inside a torrent", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("waits for the detail before pruning, then prunes against it", async () => {
+    daemon.torrents = { a: torrentSummary("a", "Alpha") };
+    nav.enter(torrentId("a"));
+    nav.markAll([fileId("a", 0), fileId("a", 9)]);
+    // No detail yet (a reconnect wiped it, the refetch is in flight): the
+    // scope is unknown, so nothing is pruned.
+    nav.pruneStaleMarks();
+    expect(nav.selection.size).toBe(2);
+
+    vi.spyOn(daemon, "request").mockResolvedValue({
+      ...torrentSummary("a", "Alpha"),
+      files: [
+        {
+          index: 0,
+          path: "e1.mkv",
+          size: 1,
+          downloaded_bytes: 0,
+          selected: true,
+          state: "idle",
+          persisted: false,
+          shared: false,
+        },
+      ],
+    });
+    await data.load("a");
+    nav.pruneStaleMarks();
+    expect(nav.isMarked(fileId("a", 0))).toBe(true);
+    expect(nav.isMarked(fileId("a", 9))).toBe(false);
   });
 });

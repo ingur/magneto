@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -86,6 +87,9 @@ pub struct Daemon {
     pub rechecked: HashSet<String>,
     // Torrents whose file check is being waited on, and what to do when it ends.
     pub checks: HashMap<String, check::Pending>,
+    // Files the stats tick last saw gaining bytes, per torrent.
+    pub active: Arc<RwLock<HashMap<String, HashSet<u32>>>>,
+    pub started_at: DateTime<Utc>,
     pub control_task: Option<JoinHandle<()>>,
     pub lan_task: Option<JoinHandle<()>>,
     pub upnp_ssdp: Option<JoinHandle<()>>,
@@ -141,6 +145,8 @@ impl Daemon {
             clients: HashMap::new(),
             rechecked: HashSet::new(),
             checks: HashMap::new(),
+            active: Arc::new(RwLock::new(HashMap::new())),
+            started_at: Utc::now(),
             control_task: None,
             lan_task: None,
             upnp_ssdp: None,
@@ -229,10 +235,10 @@ impl Daemon {
                 let result =
                     commands::select_for_resume(&self.session, &self.metadata, &info_hash, &[index])
                         .await;
-                if result.is_ok() {
+                if matches!(result, Ok(true)) {
                     let _ = self.save_metadata();
                 }
-                let _ = reply.send(result);
+                let _ = reply.send(result.map(|_| ()));
             }
             DaemonEvent::RestartRequested => {
                 info!("restart requested");
@@ -252,6 +258,13 @@ impl Daemon {
     /// listeners) keep using the inbox events.
     pub(crate) fn request_shutdown(&mut self, kind: ShutdownKind) {
         self.shutdown_kind = Some(kind);
+    }
+
+    /// Files the stats tick last saw gaining bytes. Rendering on request reads
+    /// the same set the tick renders from, so a summary and its file rows can
+    /// never disagree about what is downloading.
+    pub fn active_files(&self, info_hash: &str) -> HashSet<u32> {
+        self.active.read().get(info_hash).cloned().unwrap_or_default()
     }
 
     /// Publish the metadata store, logging a failure. It is the only record of
@@ -296,6 +309,7 @@ impl Daemon {
                 lan_port: self.started.network.lan_port,
                 upnp_active: self.upnp_active,
                 pending_restart: magneto_core::config::pending_restart(&self.started, &self.config),
+                started_at: self.started_at.to_rfc3339(),
             },
             config: self.config.clone(),
             torrents: commands::list_summaries(self).await,

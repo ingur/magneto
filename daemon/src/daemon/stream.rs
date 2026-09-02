@@ -1,10 +1,13 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
+use axum::http::header::{
+    ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE, RETRY_AFTER,
+};
 use axum::response::Response;
 use axum::routing::get;
 use parking_lot::RwLock;
@@ -13,6 +16,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::io::ReaderStream;
 use tracing::warn;
 
+use crate::daemon::commands;
+use crate::daemon::commands::Unservable;
 use crate::daemon::DaemonEvent;
 use crate::daemon::session::SessionHandle;
 use crate::daemon::short;
@@ -20,6 +25,9 @@ use crate::media;
 use crate::metadata::MetadataStore;
 
 const STREAM_BUFFER: usize = 256 * 1024;
+// How long a request waits out a file check before telling the player to retry.
+const CHECK_WAIT: Duration = Duration::from_secs(10);
+const CHECK_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 struct StreamState {
@@ -68,6 +76,12 @@ async fn handle_stream(
     if !known {
         return text_response(StatusCode::NOT_FOUND, "file not found");
     }
+    // A torrent that is checking files cannot serve anything, and the check is
+    // usually seconds, so hold the request briefly rather than failing a player
+    // that will not retry.
+    if let Some(response) = wait_until_servable(&state, &info_hash).await {
+        return response;
+    }
     // Playing implies starting: the selection goes through the event loop
     // (the single writer for selection state) and runs the same path resume
     // uses, so a paused torrent wakes up for exactly this file. A loop that
@@ -86,14 +100,14 @@ async fn handle_stream(
     };
     if let Err(e) = selected {
         warn!(hash = %short(&info_hash), error = %e, "stream selection failed");
-        return text_response(StatusCode::NOT_FOUND, "file not found");
+        return text_response(StatusCode::CONFLICT, format!("cannot start this file: {e}"));
     }
     let mime = media::mime_for(&filename);
     let open = match state.session.stream(&info_hash, file_index).await {
         Ok(o) => o,
         Err(e) => {
             warn!(hash = %short(&info_hash), error = %e, "stream open failed");
-            return text_response(StatusCode::NOT_FOUND, "file not found");
+            return text_response(StatusCode::CONFLICT, format!("cannot open this file: {e}"));
         }
     };
     let length = open.length;
@@ -154,12 +168,45 @@ fn unsatisfiable_response(total: u64, mime: &str) -> Response {
         .unwrap()
 }
 
-fn text_response(status: StatusCode, msg: &'static str) -> Response {
+fn text_response(status: StatusCode, msg: impl Into<String>) -> Response {
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Body::from(msg))
+        .body(Body::from(msg.into()))
         .unwrap()
+}
+
+fn retry_response(reason: String) -> Response {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(RETRY_AFTER, "5")
+        .body(Body::from(reason))
+        .unwrap()
+}
+
+/// Hold a request out while the engine checks files, which is usually seconds,
+/// so a player that does not retry still gets its bytes. `None` means the
+/// torrent can be served now; anything else is the response to send.
+async fn wait_until_servable(state: &StreamState, info_hash: &str) -> Option<Response> {
+    let deadline = tokio::time::Instant::now() + CHECK_WAIT;
+    loop {
+        let Some(handle) = state.session.get(info_hash) else {
+            return Some(text_response(StatusCode::NOT_FOUND, "file not found"));
+        };
+        match commands::unservable(&handle) {
+            None => return None,
+            Some(Unservable::Failed(reason)) => {
+                return Some(text_response(StatusCode::CONFLICT, reason));
+            }
+            Some(Unservable::Checking(reason)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Some(retry_response(reason));
+                }
+                tokio::time::sleep(CHECK_POLL).await;
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

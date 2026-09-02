@@ -346,6 +346,24 @@ describe("cursor movement", () => {
     a.node.remove();
     expect(kb.cursor()).toBe("b");
   });
+
+  it("clamps in DOM order, not mount order, when the cursored item unmounts", () => {
+    const { handle, el } = mountLayer();
+    // Mount c, b, a but lay them out a, b, c.
+    const nc = document.createElement("button");
+    el.appendChild(nc);
+    kbItem(nc, { id: "c" });
+    const nb = document.createElement("button");
+    el.insertBefore(nb, nc);
+    const b = kbItem(nb, { id: "b" });
+    const na = document.createElement("button");
+    el.insertBefore(na, nb);
+    kbItem(na, { id: "a" });
+    kb.setCursorOn(handle, "b");
+    nb.remove();
+    b.destroy?.();
+    expect(kb.cursor()).toBe("a");
+  });
 });
 
 describe("cursor visual (data-kb-cursor)", () => {

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { TorrentSummary } from "@/daemon/protocol";
+import type { Outbound, TorrentSummary } from "@/daemon/protocol";
 import { controlUrl, DaemonClient } from "./client.svelte";
 
 // jsdom has no WebSocket, and these tests exercise the reconnect/re-resolve
@@ -194,5 +194,112 @@ describe("DaemonClient.patchSummary", () => {
     client.torrents = { h1: summary({ persisted_count: 3 }) }; // authoritative refresh
     revert();
     expect(client.torrents.h1.persisted_count).toBe(3);
+  });
+});
+
+describe("DaemonClient wire state", () => {
+  function summary(over: Partial<TorrentSummary> = {}): TorrentSummary {
+    return {
+      info_hash: "h1",
+      name: "Movie",
+      source: "magnet:?xt=urn:btih:h1",
+      source_kind: "magnet",
+      state: "downloading",
+      error: null,
+      check_progress: null,
+      total_bytes_all: 100,
+      total_bytes_selected: 100,
+      downloaded_bytes: 50,
+      download_speed: 1000,
+      upload_speed: 200,
+      file_count: 1,
+      complete_count: 0,
+      selected_count: 1,
+      persisted_count: 0,
+      shared_count: 0,
+      is_paused: false,
+      added_at: "2026-06-01T00:00:00Z",
+      ...over,
+    };
+  }
+
+  async function connected(): Promise<{ client: DaemonClient; ws: MockSocket }> {
+    const client = new DaemonClient();
+    client.connect(vi.fn().mockResolvedValue({ port: 61481, token: null }));
+    await vi.advanceTimersByTimeAsync(0);
+    const ws = MockSocket.instances[0];
+    ws.accept();
+    return { client, ws };
+  }
+
+  function deliver(ws: MockSocket, msg: Outbound): void {
+    ws.onmessage?.({ data: JSON.stringify(msg) });
+  }
+
+  function snapshot(...torrents: TorrentSummary[]): Outbound {
+    return { type: "snapshot", daemon: {} as never, config: {} as never, torrents };
+  }
+
+  it("merges a delta one field at a time, and an explicit null clears", async () => {
+    const { client, ws } = await connected();
+    deliver(ws, snapshot(summary({ state: "error", error: "disk full" })));
+
+    deliver(ws, {
+      type: "stats",
+      torrents: [{ info_hash: "h1", downloaded_bytes: 60 }],
+      files: [],
+    });
+    expect(client.torrents.h1).toEqual(
+      summary({ state: "error", error: "disk full", downloaded_bytes: 60 }),
+    );
+
+    deliver(ws, {
+      type: "stats",
+      torrents: [{ info_hash: "h1", state: "downloading" }],
+      files: [],
+    });
+    expect(client.torrents.h1.state).toBe("downloading");
+    expect(client.torrents.h1.error).toBe("disk full"); // untouched until cleared
+
+    deliver(ws, { type: "stats", torrents: [{ info_hash: "h1", error: null }], files: [] });
+    expect(client.torrents.h1.error).toBeNull();
+
+    deliver(ws, { type: "stats", torrents: [{ info_hash: "h1", check_progress: 0.5 }], files: [] });
+    expect(client.torrents.h1.check_progress).toBe(0.5);
+    deliver(ws, {
+      type: "stats",
+      torrents: [{ info_hash: "h1", check_progress: null }],
+      files: [],
+    });
+    expect(client.torrents.h1.check_progress).toBeNull();
+  });
+
+  it("lands the summary carried by torrent_added", async () => {
+    const { client, ws } = await connected();
+    deliver(ws, snapshot());
+    deliver(ws, {
+      type: "torrent_added",
+      already_existed: false,
+      ...summary({ name: null, state: "initializing" }),
+    });
+    expect(client.torrents.h1).toEqual(summary({ name: null, state: "initializing" }));
+  });
+
+  it("leaves state to the daemon on torrent_error and torrent_complete", async () => {
+    const { client, ws } = await connected();
+    deliver(ws, snapshot(summary()));
+    deliver(ws, { type: "torrent_error", info_hash: "h1", error: "boom" });
+    deliver(ws, { type: "torrent_complete", info_hash: "h1" });
+    expect(client.torrents.h1.state).toBe("downloading");
+    expect(client.torrents.h1.error).toBeNull();
+  });
+
+  it("zeroes speeds when the socket closes", async () => {
+    const { client, ws } = await connected();
+    deliver(ws, snapshot(summary()));
+    ws.close();
+    expect(client.torrents.h1.download_speed).toBe(0);
+    expect(client.torrents.h1.upload_speed).toBe(0);
+    expect(client.torrents.h1.downloaded_bytes).toBe(50); // bytes are not a rate
   });
 });

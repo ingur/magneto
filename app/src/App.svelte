@@ -28,9 +28,15 @@
   // copy is reason-based only.
   function handleEvent(e: ServerEvent) {
     switch (e.type) {
-      case "torrent_ready":
-        toast.success(`Added ${e.name ?? "torrent"}`);
+      case "torrent_ready": {
+        // Ready also fires when a restart re-resolves torrents added long ago;
+        // only one added during this daemon run is news. Both stamps are the
+        // daemon's RFC3339, so they order as strings (as the added sort does).
+        if (e.added_at >= (daemon.daemon?.started_at ?? "")) {
+          toast.success(`Added ${e.name ?? "torrent"}`);
+        }
         break;
+      }
       case "torrent_complete": {
         const name = daemon.torrents[e.info_hash]?.name ?? "Download";
         toast.success(`${name} complete`);

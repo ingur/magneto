@@ -8,6 +8,7 @@ use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 
+use magneto_core::client;
 use magneto_core::config::Config;
 use crate::daemon::preflight;
 use crate::daemon::session::{AddOutcome, SessionHandle, TorrentHandle};
@@ -71,7 +72,7 @@ pub async fn list_summaries(daemon: &Daemon) -> Vec<TorrentSummary> {
         .iter()
         .filter_map(|h| {
             let handle = daemon.session.get(h)?;
-            Some(render_torrent_summary(&handle, meta.get(h), &daemon.config))
+            Some(render_torrent_summary(&handle, meta.get(h), &daemon.config, &daemon.active_files(h)))
         })
         .collect()
 }
@@ -86,7 +87,13 @@ async fn handle_get_torrent(daemon: &Daemon, id: String, req: GetTorrentReq) -> 
         return Outbound::error(id, format!("no torrent with info_hash {}", req.info_hash));
     };
     let meta_guard = daemon.metadata.read();
-    let detail = render_torrent_detail(&handle, meta_guard.get(&req.info_hash), &daemon.config);
+    let active = daemon.active_files(&req.info_hash);
+    let detail = render_torrent_detail(
+        &handle,
+        meta_guard.get(&req.info_hash),
+        &daemon.config,
+        &active,
+    );
     Outbound::response(id, detail)
 }
 
@@ -96,8 +103,6 @@ async fn handle_get_torrent(daemon: &Daemon, id: String, req: GetTorrentReq) -> 
 /// inside add_torrent and a dead swarm never resolves, which would freeze
 /// every other command (and shutdown) behind it. The session call runs in its
 /// own task under a watchdog; the reply reaches the client via AddCompleted.
-const ADD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
 fn start_add_torrent(
     daemon: &Daemon,
     client: ClientId,
@@ -127,11 +132,11 @@ fn start_add_torrent(
         };
         let outcome = tokio::select! {
             _ = cancel.cancelled() => return,
-            res = tokio::time::timeout(ADD_TIMEOUT, add) => match res {
+            res = tokio::time::timeout(client::ADD_TIMEOUT, add) => match res {
                 Ok(r) => r,
                 Err(_) => Err(anyhow::anyhow!(
                     "metadata not resolved within {}s",
-                    ADD_TIMEOUT.as_secs()
+                    client::ADD_TIMEOUT.as_secs()
                 )),
             },
         };
@@ -178,21 +183,16 @@ pub(crate) async fn finish_add(
     // recovery attempt even if the automatic one is spent.
     daemon.rechecked.remove(&info_hash);
 
-    let (state, source, finalized) = {
+    let active = daemon.active_files(&info_hash);
+    let (summary, finalized) = {
         let meta = daemon.metadata.read();
         let entry = meta.get(&info_hash);
         (
-            render_torrent_summary(&handle, entry, &daemon.config).state,
-            entry.map(|e| e.source.clone()).unwrap_or_default(),
+            render_torrent_summary(&handle, entry, &daemon.config, &active),
             entry.is_some_and(|e| e.finalized),
         )
     };
-    daemon.broadcast(Outbound::TorrentAdded(TorrentAddedEvent {
-        info_hash: info_hash.clone(),
-        source,
-        state,
-        already_existed,
-    }));
+    daemon.broadcast(Outbound::TorrentAdded(TorrentAddedEvent { summary, already_existed }));
 
     let outcome = finalize_torrent(daemon, &info_hash, Finalize::Add).await;
     let resp = AddTorrentResp {
@@ -269,9 +269,10 @@ pub(crate) async fn finalize_torrent(
     if outcome.media == Some(true)
         && let Some(handle) = daemon.session.get(info_hash)
     {
+        let active = daemon.active_files(info_hash);
         let detail = {
             let meta = daemon.metadata.read();
-            render_torrent_detail(&handle, meta.get(info_hash), &daemon.config)
+            render_torrent_detail(&handle, meta.get(info_hash), &daemon.config, &active)
         };
         daemon.broadcast(Outbound::TorrentReady(detail));
     }
@@ -333,8 +334,9 @@ async fn finalize_inner(daemon: &mut Daemon, info_hash: &str, from: Finalize) ->
     if !finalized {
         apply_engine_policy(daemon, info_hash, &media, &subs, from).await;
     }
+    let active = daemon.active_files(info_hash);
     let meta = daemon.metadata.read();
-    let detail = render_torrent_detail(&handle, meta.get(info_hash), &daemon.config);
+    let detail = render_torrent_detail(&handle, meta.get(info_hash), &daemon.config, &active);
     FinalizeOutcome {
         state: Some(detail.summary.state),
         files: Some(detail.files),
@@ -614,6 +616,10 @@ pub async fn reconcile(daemon: &mut Daemon) {
         }
     }
     let hashes: Vec<String> = daemon.session.list_infohashes();
+    let rebuilt = {
+        let meta = daemon.metadata.read();
+        hashes.iter().filter(|hash| !meta.contains(hash)).count()
+    };
     for hash in hashes {
         // Only a record whose add never classified takes the add policy: any
         // other torrent already has a selection that is not ours to rewrite.
@@ -626,6 +632,9 @@ pub async fn reconcile(daemon: &mut Daemon) {
         finalize_torrent(daemon, &hash, from).await;
     }
     let _ = daemon.save_metadata();
+    if rebuilt > 0 {
+        info!(count = rebuilt, "recovered torrent records");
+    }
     info!("reconciliation complete");
 }
 
@@ -765,8 +774,10 @@ fn split_targets(targets: Vec<Target>) -> (Vec<String>, Vec<Target>) {
 async fn handle_pause(daemon: &mut Daemon, id: String, req: TargetsReq) -> Outbound {
     let (torrent_hashes, file_folder) = split_targets(req.targets);
     let mut affected = 0u32;
+    let mut refused: Option<String> = None;
     for hash in &torrent_hashes {
         if let Err(e) = daemon.session.pause(hash).await {
+            refused = refused.or_else(|| Some(e.to_string()));
             warn!(hash = %short(hash), error = %e, "pause failed");
             continue;
         }
@@ -781,6 +792,10 @@ async fn handle_pause(daemon: &mut Daemon, id: String, req: TargetsReq) -> Outbo
         };
         for (info_hash, expanded) in grouped {
             let Some(handle) = daemon.session.get(&info_hash) else { continue };
+            if let Some(reason) = checking(&handle) {
+                refused = refused.or(Some(reason));
+                continue;
+            }
             let media = media_indices(&daemon.metadata, &info_hash);
             let subs = subtitle_indices(&handle);
             let current = current_selection(&handle);
@@ -798,6 +813,11 @@ async fn handle_pause(daemon: &mut Daemon, id: String, req: TargetsReq) -> Outbo
         }
         let _ = daemon.save_metadata();
     }
+    if affected == 0
+        && let Some(reason) = refused
+    {
+        return Outbound::error(id, reason);
+    }
     Outbound::response(id, AffectedResp { affected })
 }
 
@@ -809,15 +829,20 @@ fn set_paused_flag(
     info_hash: &str,
     indices: &[u32],
     paused: bool,
-) {
+) -> bool {
+    let mut changed = false;
     let mut meta = metadata.write();
     if let Some(entry) = meta.get_mut(info_hash) {
         for idx in indices {
-            if let Some(f) = entry.files.get_mut(idx) {
+            if let Some(f) = entry.files.get_mut(idx)
+                && f.paused != paused
+            {
                 f.paused = paused;
+                changed = true;
             }
         }
     }
+    changed
 }
 
 /// Next `only_files` after removing `expanded` from a torrent's current
@@ -856,8 +881,13 @@ async fn handle_drop_targets(daemon: &mut Daemon, id: String, req: TargetsReq) -
         Err(e) => return Outbound::error(id, e),
     };
     let mut affected = 0u32;
+    let mut refused: Option<String> = None;
     for (info_hash, expanded) in grouped {
         let Some(handle) = daemon.session.get(&info_hash) else { continue };
+        if let Some(reason) = checking(&handle) {
+            refused = refused.or(Some(reason));
+            continue;
+        }
         let media = media_indices(&daemon.metadata, &info_hash);
         let subs = subtitle_indices(&handle);
         let current = current_selection(&handle);
@@ -895,6 +925,11 @@ async fn handle_drop_targets(daemon: &mut Daemon, id: String, req: TargetsReq) -
             }
         }
     }
+    if affected == 0
+        && let Some(reason) = refused
+    {
+        return Outbound::error(id, reason);
+    }
     Outbound::response(id, AffectedResp { affected })
 }
 
@@ -906,7 +941,7 @@ async fn handle_resume(daemon: &mut Daemon, id: String, req: TargetsReq) -> Outb
         Err(e) => return Outbound::error(id, e),
     };
     let mut affected = 0u32;
-    let mut initializing = 0u32;
+    let mut refused: Option<String> = None;
     for (info_hash, expanded) in grouped {
         let Some(handle) = daemon.session.get(&info_hash) else { continue };
         let engine_state = handle.stats().state;
@@ -914,7 +949,7 @@ async fn handle_resume(daemon: &mut Daemon, id: String, req: TargetsReq) -> Outb
             // The engine rejects selection changes mid-check, and starting it
             // here would race the in-flight init task. Report instead of
             // silently doing nothing.
-            initializing += 1;
+            refused = refused.or_else(|| unservable(&handle).map(Unservable::message));
             continue;
         }
         if let Err(e) =
@@ -942,8 +977,10 @@ async fn handle_resume(daemon: &mut Daemon, id: String, req: TargetsReq) -> Outb
         affected += expanded.len() as u32;
     }
     let _ = daemon.save_metadata();
-    if affected == 0 && initializing > 0 {
-        return Outbound::error(id, "torrent is still checking files; try again shortly");
+    if affected == 0
+        && let Some(reason) = refused
+    {
+        return Outbound::error(id, reason);
     }
     Outbound::response(id, AffectedResp { affected })
 }
@@ -1006,12 +1043,15 @@ fn resume_groups(
 /// those convert to per-file pauses instead, so only the targets resume once
 /// the torrent goes live. Shared by resume and the stream endpoint: playing a
 /// file starts exactly that file.
+///
+/// Reports whether anything changed, so a repeat (every range request of a
+/// stream) costs no engine or disk write.
 pub(crate) async fn select_for_resume(
     session: &SessionHandle,
     metadata: &RwLock<MetadataStore>,
     info_hash: &str,
     targets: &[u32],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let handle = session
         .get(info_hash)
         .with_context(|| format!("no torrent with info_hash {info_hash}"))?;
@@ -1028,17 +1068,19 @@ pub(crate) async fn select_for_resume(
         // it would only make its row lie.
         .filter(|i| !file_complete(&handle, &stats.file_progress, *i))
         .collect();
-    let mut next: HashSet<usize> =
-        if session::engine_paused(&stats.state) && !rest_paused.is_empty() {
-            set_paused_flag(metadata, info_hash, &rest_paused, true);
-            added
-        } else {
-            current.union(&added).copied().collect()
-        };
+    let mut next: HashSet<usize> = current.union(&added).copied().collect();
+    if session::engine_paused(&stats.state) && !rest_paused.is_empty() {
+        // Only the incomplete siblings step aside: the targets are what the
+        // user asked to start, and a file already on disk keeps its place.
+        set_paused_flag(metadata, info_hash, &rest_paused, true);
+        next.retain(|i| !rest_paused.contains(&(*i as u32)));
+    }
     next.extend(subs.iter().map(|i| *i as usize));
-    session.update_only_files(info_hash, &next).await?;
-    set_paused_flag(metadata, info_hash, targets, false);
-    Ok(())
+    if next != current {
+        session.update_only_files(info_hash, &next).await?;
+    }
+    let cleared = set_paused_flag(metadata, info_hash, targets, false);
+    Ok(next != current || cleared)
 }
 
 async fn handle_set_persist(
@@ -1093,6 +1135,55 @@ async fn handle_set_shared(daemon: &mut Daemon, id: String, req: SetSharedReq) -
     Outbound::response(id, AffectedResp { affected })
 }
 
+/// Why the engine cannot serve this torrent's files, if it cannot.
+pub(crate) enum Unservable {
+    Checking(String),
+    Failed(String),
+}
+
+impl Unservable {
+    pub(crate) fn message(self) -> String {
+        match self {
+            Self::Checking(m) | Self::Failed(m) => m,
+        }
+    }
+}
+
+/// Why a selection change has to wait, if it does. An errored torrent accepts
+/// one; a checking torrent does not.
+fn checking(handle: &TorrentHandle) -> Option<String> {
+    match unservable(handle) {
+        Some(Unservable::Checking(reason)) => Some(reason),
+        _ => None,
+    }
+}
+
+pub(crate) fn unservable(handle: &TorrentHandle) -> Option<Unservable> {
+    let stats = handle.stats();
+    match stats.state {
+        TorrentStatsState::Initializing { .. } => {
+            let pct = if stats.total_bytes > 0 {
+                (stats.progress_bytes as f64 / stats.total_bytes as f64 * 100.0).round() as u32
+            } else {
+                0
+            };
+            Some(Unservable::Checking(if pct == 0 {
+                "torrent is queued for a file check".to_string()
+            } else {
+                format!("torrent is checking files ({pct}%)")
+            }))
+        }
+        TorrentStatsState::Error => Some(Unservable::Failed(
+            stats
+                .error
+                .as_deref()
+                .map(|e| format!("torrent failed: {}", first_line(e)))
+                .unwrap_or_else(|| "torrent failed".to_string()),
+        )),
+        _ => None,
+    }
+}
+
 async fn handle_play(daemon: &mut Daemon, id: String, req: TargetsReq) -> Outbound {
     if daemon.config.player.command.trim().is_empty() {
         return Outbound::error(id, "player command is not configured");
@@ -1102,12 +1193,22 @@ async fn handle_play(daemon: &mut Daemon, id: String, req: TargetsReq) -> Outbou
         Err(e) => return Outbound::error(id, e),
     };
     let mut items: Vec<PlayItem> = Vec::new();
+    let mut refused: Option<String> = None;
     for (info_hash, indices) in &grouped {
         let Some(handle) = daemon.session.get(info_hash) else { continue };
+        // The engine has no per-file progress while it checks or after it
+        // errored, so every uri would be a stream url that cannot serve.
+        if let Some(reason) = unservable(&handle) {
+            refused = refused.or_else(|| Some(reason.message()));
+            continue;
+        }
         items.extend(build_play_items(&handle, indices, &daemon.started));
     }
     if items.is_empty() {
-        return Outbound::error(id, "no playable files in targets");
+        return Outbound::error(
+            id,
+            refused.unwrap_or_else(|| "no playable files in targets".to_string()),
+        );
     }
     let uris: Vec<String> = items.iter().map(|i| i.uri.clone()).collect();
     if let Err(e) = player::launch_player(&daemon.config.player, &uris) {
@@ -1131,25 +1232,25 @@ async fn handle_resolve_local_path(
     let Some(handle) = daemon.session.get(&info_hash) else {
         return Outbound::error(id, format!("no torrent with info_hash {info_hash}"));
     };
+    let single_file = handle.with_metadata(|m| m.file_infos.len() == 1).unwrap_or(false);
     let (path, kind) = match req.target {
-        Target::Torrent { .. } => {
-            (torrent_local_root(&handle, &daemon.started.downloads.dir), PathKind::Folder)
-        }
+        // A single-file torrent has no folder of its own: revealing it means
+        // revealing the file, not the whole downloads dir.
+        Target::Torrent { .. } if single_file => match file_local_path(&handle, 0) {
+            Some(p) => (p, PathKind::File),
+            None => return Outbound::error(id, "could not resolve file path"),
+        },
+        Target::Torrent { .. } => (handle.output_folder().to_path_buf(), PathKind::Folder),
         Target::Folder { path, .. } => {
             let normalized = path.trim_matches('/').replace('\\', "/");
-            let candidate = std::path::Path::new(&normalized);
-            if candidate.is_absolute()
-                || candidate
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                return Outbound::error(id, "path must be relative without parent components");
+            if !folder_belongs_to_torrent(&handle, &normalized) {
+                return Outbound::error(id, "folder is not part of this torrent");
             }
-            let root = torrent_local_root(&handle, &daemon.started.downloads.dir);
+            let root = handle.output_folder().to_path_buf();
             let p = if normalized.is_empty() { root } else { root.join(&normalized) };
             (p, PathKind::Folder)
         }
-        Target::File { file_index, .. } => match file_local_path(&handle, file_index as usize, &daemon.started.downloads.dir) {
+        Target::File { file_index, .. } => match file_local_path(&handle, file_index as usize) {
             Some(p) => (p, PathKind::File),
             None => return Outbound::error(id, "could not resolve file path"),
         },
@@ -1159,6 +1260,23 @@ async fn handle_resolve_local_path(
         id,
         ResolveLocalPathResp { path: path.to_string_lossy().into_owned(), kind, exists },
     )
+}
+
+/// Whether a folder target names a real folder inside the torrent. Anything
+/// else, including a path that climbs out with `..`, would resolve into another
+/// torrent's data.
+fn folder_belongs_to_torrent(handle: &TorrentHandle, normalized: &str) -> bool {
+    if normalized.is_empty() {
+        return true;
+    }
+    let prefix = format!("{normalized}/");
+    handle
+        .with_metadata(|m| {
+            m.file_infos.iter().any(|fi| {
+                path_to_string(&fi.relative_filename).starts_with(&prefix)
+            })
+        })
+        .unwrap_or(false)
 }
 
 async fn handle_set_config(
@@ -1473,7 +1591,7 @@ pub fn hybrid_uri(
     config: &Config,
 ) -> String {
     if downloaded >= size
-        && let Some(path) = file_local_path(handle, file_index, &config.downloads.dir)
+        && let Some(path) = file_local_path(handle, file_index)
         && path.exists()
     {
         return path.to_string_lossy().into_owned();
@@ -1490,19 +1608,19 @@ pub fn stream_url(info_hash: &str, file_index: usize, filename: &str, port: u16)
 
 // One assembly per torrent: media_file_progress reads the engine once into
 // FileProgress; render_file_entries turns those into wire FileEntry rows (the
-// `recently_active` set decides Downloading vs Queued: None on a cold snapshot,
-// the tick-history set in the stats loop); summarize aggregates the rows. The
-// stats tick and the request handlers share this path so the summary and the
-// per-file rows can never disagree on a torrent's state.
+// `active` set decides Downloading vs Queued); summarize aggregates the rows.
+// The stats tick and the request handlers render from the same set, so the
+// summary and the per-file rows can never disagree on a torrent's state.
 
 pub fn render_torrent_detail(
     handle: &TorrentHandle,
     meta: Option<&TorrentMetadata>,
     config: &Config,
+    active: &HashSet<u32>,
 ) -> TorrentDetail {
     let stats = handle.stats();
     let progress = media_file_progress(handle, &stats, meta, config);
-    let files = render_file_entries(stats.state, &progress, meta, config, None);
+    let files = render_file_entries(stats.state, &progress, meta, config, active);
     let summary = summarize(handle, &stats, meta, &files);
     TorrentDetail { summary, files }
 }
@@ -1511,10 +1629,11 @@ pub fn render_torrent_summary(
     handle: &TorrentHandle,
     meta: Option<&TorrentMetadata>,
     config: &Config,
+    active: &HashSet<u32>,
 ) -> TorrentSummary {
     let stats = handle.stats();
     let progress = media_file_progress(handle, &stats, meta, config);
-    let files = render_file_entries(stats.state, &progress, meta, config, None);
+    let files = render_file_entries(stats.state, &progress, meta, config, active);
     summarize(handle, &stats, meta, &files)
 }
 
@@ -1560,14 +1679,14 @@ pub fn media_file_progress(
         .collect()
 }
 
-/// Wire FileEntry rows for the media files. `recently_active` is the set counted
-/// as actively downloading (None = cold head-only).
+/// Wire FileEntry rows for the media files. `recently_active` is the set the
+/// stats tick observed gaining bytes.
 pub fn render_file_entries(
     torrent_state: TorrentStatsState,
     files: &[FileProgress],
     meta: Option<&TorrentMetadata>,
     config: &Config,
-    recently_active: Option<&HashSet<u32>>,
+    recently_active: &HashSet<u32>,
 ) -> Vec<FileEntry> {
     let active = active_indices(files, recently_active);
     files
@@ -1609,12 +1728,22 @@ pub fn summarize(
     let added_at = meta
         .map(|m| m.added_at.to_rfc3339())
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-    let state = aggregate_torrent_state(stats.state, files);
+    let state = match aggregate_torrent_state(stats.state, files) {
+        // No file map to aggregate yet: the add has not classified this
+        // torrent, so it is not an empty one.
+        TorrentState::Idle if meta.is_some_and(|m| !m.finalized) => TorrentState::Initializing,
+        state => state,
+    };
     let total_bytes_all: u64 = files.iter().map(|f| f.size).sum();
     let total_bytes_selected: u64 = files.iter().filter(|f| f.selected).map(|f| f.size).sum();
     let downloaded_bytes: u64 =
         files.iter().filter(|f| f.selected).map(|f| f.downloaded_bytes).sum();
-    let live_running = stats.live.is_some();
+    let check_progress = match stats.state {
+        TorrentStatsState::Initializing { .. } if stats.total_bytes > 0 => {
+            Some(stats.progress_bytes as f64 / stats.total_bytes as f64)
+        }
+        _ => None,
+    };
     // librqbit reports speed in MiB/s (Speed.mbps); the wire contract is bytes
     // per second. Convert at this single boundary.
     let (download_speed, upload_speed) = stats
@@ -1629,9 +1758,13 @@ pub fn summarize(
     TorrentSummary {
         info_hash: handle.info_hash().as_string(),
         name: handle.name(),
-        source: meta.map(|m| m.source.clone()),
-        source_kind: meta.map(|m| m.source_kind),
+        // A torrent with no record yet has no known source. The clients treat
+        // the empty string as "cannot re-add this".
+        source: meta.map(|m| m.source.clone()).unwrap_or_default(),
+        source_kind: meta.map(|m| m.source_kind).unwrap_or(SourceKind::File),
         state,
+        error: stats.error.as_deref().map(first_line),
+        check_progress,
         total_bytes_all,
         total_bytes_selected,
         downloaded_bytes,
@@ -1642,11 +1775,18 @@ pub fn summarize(
         selected_count,
         persisted_count,
         shared_count,
-        is_initializing: matches!(state, TorrentState::Initializing),
-        is_complete: matches!(state, TorrentState::Complete),
-        is_seeding: matches!(state, TorrentState::Complete) && live_running,
         is_paused: session::engine_paused(&stats.state),
         added_at,
+    }
+}
+
+/// The engine formats an error as a multi-line cause chain. Only the first line
+/// is worth a row, and it still needs a bound.
+fn first_line(error: &str) -> String {
+    let line = error.lines().next().unwrap_or_default().trim();
+    match line.char_indices().nth(160) {
+        Some((cut, _)) => format!("{}...", &line[..cut]),
+        None => line.to_string(),
     }
 }
 
@@ -1699,32 +1839,25 @@ pub struct FileProgress {
     pub size: u64,
 }
 
-/// The media files currently receiving data. librqbit downloads files one at
-/// a time in relative-path order, compared as paths (component by component),
-/// not as strings, which differs around separators ("Show - Extras/x" sorts
-/// after "Show/y" as a path but before it as a string). So the "head", the
-/// path-first selected-incomplete file, is always active (nothing is ahead of
-/// it). `recently_active` additionally marks files that gained bytes in the
-/// recent past: a file being streamed out of order, or the next file as the
-/// head finishes. It is `None` on a cold snapshot (no progress history yet),
-/// where only the head is known.
-pub fn active_indices(
-    files: &[FileProgress],
-    recently_active: Option<&HashSet<u32>>,
-) -> HashSet<u32> {
-    let mut active = HashSet::new();
-    let pending = || files.iter().filter(|f| f.selected && f.downloaded < f.size);
-    if let Some(head) = pending().min_by(|a, b| Path::new(&a.path).cmp(Path::new(&b.path))) {
-        active.insert(head.index);
-    }
-    if let Some(recent) = recently_active {
-        for f in pending() {
-            if recent.contains(&f.index) {
-                active.insert(f.index);
-            }
-        }
-    }
-    active
+/// The file the engine works on next: it downloads them one at a time in
+/// relative-path order, compared as paths rather than as strings, which differs
+/// around separators ("Show - Extras/x" sorts after "Show/y" as a path but
+/// before it as a string).
+pub fn head_pending(files: &[FileProgress]) -> Option<u32> {
+    files
+        .iter()
+        .filter(|f| f.selected && f.downloaded < f.size)
+        .min_by(|a, b| Path::new(&a.path).cmp(Path::new(&b.path)))
+        .map(|f| f.index)
+}
+
+/// The media files receiving data: the ones the stats tick saw gaining bytes.
+pub fn active_indices(files: &[FileProgress], recently_active: &HashSet<u32>) -> HashSet<u32> {
+    files
+        .iter()
+        .filter(|f| f.selected && f.downloaded < f.size && recently_active.contains(&f.index))
+        .map(|f| f.index)
+        .collect()
 }
 
 pub fn aggregate_torrent_state(
@@ -1755,37 +1888,19 @@ pub fn aggregate_torrent_state(
     if files.iter().any(|f| matches!(f.state, FileState::Downloading)) {
         return TorrentState::Downloading;
     }
+    // Selected work left with nothing arriving: no peers, or none that have
+    // what is left.
+    if files.iter().any(|f| matches!(f.state, FileState::Queued)) {
+        return TorrentState::Stalled;
+    }
     if files.iter().any(|f| matches!(f.state, FileState::Paused)) {
         return TorrentState::Paused;
     }
     TorrentState::Idle
 }
 
-// Reconstructs a torrent's on-disk root. Single-file torrents live directly in
-// the downloads dir; multi-file torrents live in a subfolder named after the
-// torrent, matching how the torrent engine derives that subfolder for the common
-// case. For unnamed or non-UTF-8 torrents the engine's chosen subfolder can
-// differ, so a path produced from this root is best-effort: callers must treat a
-// non-existent path as "unavailable" rather than authoritative.
-pub fn torrent_local_root(handle: &TorrentHandle, download_dir: &Path) -> PathBuf {
-    let multi_file = handle
-        .with_metadata(|m| m.file_infos.len() >= 2)
-        .unwrap_or(false);
-    if !multi_file {
-        return download_dir.to_path_buf();
-    }
-    match handle.name() {
-        Some(n) if !n.is_empty() => download_dir.join(n),
-        _ => download_dir.to_path_buf(),
-    }
-}
-
-pub fn file_local_path(
-    handle: &TorrentHandle,
-    file_index: usize,
-    download_dir: &Path,
-) -> Option<PathBuf> {
-    let root = torrent_local_root(handle, download_dir);
+pub fn file_local_path(handle: &TorrentHandle, file_index: usize) -> Option<PathBuf> {
+    let root = handle.output_folder();
     handle
         .with_metadata(|m| {
             m.file_infos
@@ -1895,43 +2010,28 @@ mod tests {
     }
 
     #[test]
-    fn active_indices_head_only_without_history() {
-        // Cold snapshot: only the filename-first selected-incomplete file is active.
+    fn nothing_is_active_without_observed_gains() {
+        // A live torrent receiving nothing must not claim a download.
         let files = vec![fp(0, "a.mkv", true, 10, 100), fp(1, "b.mkv", true, 0, 100)];
-        assert_eq!(active_indices(&files, None), HashSet::from([0]));
+        assert_eq!(active_indices(&files, &HashSet::new()), HashSet::new());
     }
 
     #[test]
-    fn active_indices_orders_paths_by_components_not_strings() {
-        // "Show - Extras/…" sorts before "Show/…" as a string (' ' < '/') but
-        // after it as a path; the head must follow the engine's path order.
-        let files = vec![
-            fp(0, "Show - Extras/a.mkv", true, 0, 100),
-            fp(1, "Show/b.mkv", true, 0, 100),
-        ];
-        assert_eq!(active_indices(&files, None), HashSet::from([1]));
-    }
-
-    #[test]
-    fn active_indices_adds_recently_active_out_of_order_file() {
-        // A non-head file that recently gained bytes (e.g. being streamed) is
-        // active alongside the head.
+    fn active_files_are_the_ones_that_gained_bytes() {
         let files = vec![fp(0, "a.mkv", true, 10, 100), fp(1, "b.mkv", true, 20, 100)];
-        let recent = HashSet::from([1]);
-        assert_eq!(active_indices(&files, Some(&recent)), HashSet::from([0, 1]));
+        assert_eq!(active_indices(&files, &HashSet::from([1])), HashSet::from([1]));
     }
 
     #[test]
     fn active_indices_ignores_complete_and_unselected() {
-        // The head skips complete/unselected files, and a stale recent entry for
-        // one of them can't make it active.
+        // A stale recent entry cannot light a file that is complete or that the
+        // user is not downloading.
         let files = vec![
             fp(0, "a.mkv", true, 100, 100),
             fp(1, "b.mkv", false, 0, 100),
             fp(2, "c.mkv", true, 0, 100),
         ];
-        let recent = HashSet::from([0, 1]);
-        assert_eq!(active_indices(&files, Some(&recent)), HashSet::from([2]));
+        assert_eq!(active_indices(&files, &HashSet::from([0, 1, 2])), HashSet::from([2]));
     }
 
     #[test]

@@ -4,8 +4,9 @@
 //!
 //! The queue here is the single buffer: sources stay in it until the frontend
 //! has a live daemon connection and drains via `take_pending_sources`, so a
-//! source survives webview reloads and a daemon that is still spawning.
-//! Every arrival also emits `sources-ready`; a missed ping is harmless
+//! source survives webview reloads and a daemon that is still spawning. A
+//! source whose add fails comes back through `requeue_sources` for the next
+//! drain. Every arrival also emits `sources-ready`; a missed ping is harmless
 //! because every (re)connect snapshot triggers a drain too.
 
 use std::path::Path;
@@ -80,6 +81,14 @@ pub fn queue(app: &AppHandle, sources: Vec<String>) {
 #[tauri::command]
 pub fn take_pending_sources(state: tauri::State<'_, Pending>) -> Vec<String> {
     std::mem::take(&mut *state.0.lock().unwrap())
+}
+
+/// Hand back sources the daemon did not accept (it was restarting, the
+/// request timed out), so a failed add is retried on the next drain instead
+/// of being lost with its toast. No ping: nothing new arrived.
+#[tauri::command]
+pub fn requeue_sources(state: tauri::State<'_, Pending>, sources: Vec<String>) {
+    state.0.lock().unwrap().extend(sources);
 }
 
 #[cfg(test)]

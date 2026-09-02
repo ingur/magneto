@@ -414,6 +414,11 @@ class KB {
     return layer.items.get(layer.cursorId)?.node ?? null;
   }
 
+  // The cursor id of a given layer, active or not (setCursorOn's read side).
+  cursorOn(handle: LayerHandle): string | null {
+    return this.resolve(handle)?.cursorId ?? null;
+  }
+
   // Run an item's activate. With no id, runs the cursored item's activate.
   // With an id, runs that specific item's activate, used by mouse paths
   // (dblclick on a row, click on a menu item) so kb.activate is the
@@ -467,12 +472,13 @@ class KB {
   }
 
   // Engine-internal (kbItem action). The item has already been removed
-  // from the layer's map; if it held the cursor, clamp to the first
-  // remaining item (insertion order) so the visual cursor never lingers
-  // on a gone node.
+  // from the layer's map and the DOM; if it held the cursor, clamp to the
+  // first remaining item in visual order so the cursor never lingers on a
+  // gone node. Its former neighbours are unknowable here, so a layer that
+  // wants the cursor handed to one moves it before the item unmounts.
   clampCursorAfterRemoval(layer: Layer, removedId: string) {
     if (layer.cursorId === removedId) {
-      this.writeCursor(layer, layer.items.values().next().value?.id ?? null);
+      this.writeCursor(layer, this.orderedItems(layer)[0]?.id ?? null);
     }
   }
 

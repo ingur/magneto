@@ -7,9 +7,11 @@ function summary(over: Partial<TorrentSummary> = {}): TorrentSummary {
   return {
     info_hash: "h1",
     name: "Movie",
-    source: null,
-    source_kind: null,
+    source: "",
+    source_kind: "magnet",
     state: "downloading",
+    error: null,
+    check_progress: null,
     total_bytes_all: 100,
     total_bytes_selected: 100,
     downloaded_bytes: 50,
@@ -20,9 +22,6 @@ function summary(over: Partial<TorrentSummary> = {}): TorrentSummary {
     selected_count: 2,
     persisted_count: 0,
     shared_count: 0,
-    is_initializing: false,
-    is_complete: false,
-    is_seeding: false,
     is_paused: false,
     added_at: "2026-06-01T00:00:00Z",
     ...over,
@@ -97,6 +96,40 @@ describe("projectRoot", () => {
     ]);
     expect(row.size).toBe(1000);
     expect(row.remaining).toBe(500);
+  });
+
+  it("derives seeding and completion from state, never from the wire", () => {
+    const complete = summary({ state: "complete", total_bytes_selected: 0 });
+    expect(projectRoot([complete])[0].isSeeding).toBe(true);
+    expect(projectRoot([complete])[0].progress).toBe(1);
+    expect(projectRoot([summary({ state: "complete", is_paused: true })])[0].isSeeding).toBe(false);
+    expect(projectRoot([summary({ state: "downloading" })])[0].isSeeding).toBe(false);
+    expect(projectRoot([summary({ state: "idle", total_bytes_selected: 0 })])[0].progress).toBe(0);
+  });
+
+  it("tracks a file check on an initializing row and flags unresolved metadata", () => {
+    const checking = summary({ state: "initializing", check_progress: 0.4, downloaded_bytes: 0 });
+    const [row] = projectRoot([checking]);
+    expect(row.progress).toBeCloseTo(0.4);
+    expect(row.checkProgress).toBeCloseTo(0.4);
+    expect(row.resolving).toBe(false);
+
+    const [queued] = projectRoot([summary({ state: "initializing", downloaded_bytes: 0 })]);
+    expect(queued.progress).toBe(0);
+    expect(queued.checkProgress).toBeUndefined();
+
+    const [resolving] = projectRoot([summary({ state: "initializing", name: null })]);
+    expect(resolving.resolving).toBe(true);
+    // A metadata fetch that failed is an errored row, not one still resolving.
+    const [failed] = projectRoot([summary({ state: "error", name: null, error: "no peers" })]);
+    expect(failed.resolving).toBe(false);
+  });
+
+  it("carries the engine's error text", () => {
+    expect(projectRoot([summary({ state: "error", error: "disk full" })])[0].error).toBe(
+      "disk full",
+    );
+    expect(projectRoot([summary()])[0].error).toBeUndefined();
   });
 });
 

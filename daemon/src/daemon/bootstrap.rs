@@ -124,6 +124,7 @@ async fn start_once(
         inbox_tx.clone(),
         daemon.session.clone(),
         daemon.metadata.clone(),
+        daemon.active.clone(),
         daemon.config_tx.subscribe(),
     ));
 

@@ -120,7 +120,8 @@ pub fn run() {
             open::open_path,
             open::open_url,
             quit_app,
-            sources::take_pending_sources
+            sources::take_pending_sources,
+            sources::requeue_sources
         ])
         .setup(|app| {
             theme::init(app.handle());

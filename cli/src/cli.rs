@@ -122,6 +122,7 @@ async fn add_sources(sources: Vec<String>) -> Result<()> {
             "add_torrent",
             serde_json::json!({ "source": prepared }),
             token.as_deref(),
+            client::ADD_REQUEST_TIMEOUT,
         )
         .await
         {

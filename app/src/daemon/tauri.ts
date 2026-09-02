@@ -54,6 +54,12 @@ export async function takePendingSources(): Promise<string[]> {
   return invoke<string[]>("take_pending_sources");
 }
 
+/** Hand sources whose add failed back to the host queue for the next drain.
+ *  No-op outside Tauri. */
+export async function requeueSources(sources: string[]): Promise<void> {
+  if (isTauri()) await invoke("requeue_sources", { sources });
+}
+
 /** Subscribe to the host's ping that new OS-handed sources are queued.
  *  Returns an unsubscriber (the async registration is absorbed here so
  *  consumers get the same shape as daemon.onEvent); inert outside Tauri. */

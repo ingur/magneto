@@ -43,6 +43,7 @@
     queued: "bg-progress-idle",
     paused: "bg-progress-idle",
     downloading: "bg-progress-active",
+    stalled: "bg-progress-active",
     complete: "bg-progress-done",
     error: "bg-progress-error",
   };
@@ -61,6 +62,7 @@
   // redundant), and a seeding torrent shows "seeding".
   const STATE_LABEL: Record<Row["state"], { text: string; class: string }> = {
     downloading: { text: "downloading", class: "text-info" },
+    stalled: { text: "stalled", class: "text-warning" },
     queued: { text: "queued", class: "text-subtle" },
     paused: { text: "paused", class: "text-muted" },
     idle: { text: "idle", class: "text-subtle" },
@@ -72,7 +74,11 @@
   type Stat = { text: string; class?: string };
   const stats = $derived.by<Stat[]>(() => {
     const out: Stat[] = [{ text: formatBytes(row.size) }];
-    if (row.state !== "complete") out.push({ text: formatPercent(row.progress) });
+    // An initializing row has no download progress to speak of; a running
+    // file check reports its own percent below.
+    if (row.state !== "complete" && row.state !== "initializing") {
+      out.push({ text: formatPercent(row.progress) });
+    }
 
     // Speed + ETA: torrent rows only; folders/files have no attributable speed.
     const showSpeed =
@@ -81,6 +87,8 @@
       out.push({ text: `↓ ${formatSpeed(row.downloadSpeed!)}`, class: "text-info" });
       const eta = formatEta(row.remaining ?? 0, row.downloadSpeed!);
       if (eta) out.push({ text: `ETA ${eta}` });
+    } else if (row.checkProgress !== undefined) {
+      out.push({ text: `checking ${formatPercent(row.checkProgress)}`, class: "text-subtle" });
     } else if (!(row.state === "complete" && row.isSeeding)) {
       out.push(STATE_LABEL[row.state]);
     }
@@ -97,6 +105,9 @@
         out.push({ text: `${row.downloadingCount}↓`, class: "text-info" });
       }
     }
+
+    // The engine's reason, last so the line truncates it rather than the counts.
+    if (row.error) out.push({ text: row.error, class: "text-danger" });
     return out;
   });
 
@@ -123,8 +134,9 @@
 
   // Persist is the always-visible blue row button (not in the menu). Delete
   // is destructive: bottom, under a divider, the only danger-tinted item.
+  // An initializing torrent has no download to pause or resume yet.
   const menuItems: MenuItem[] = $derived([
-    ...(row.state !== "complete"
+    ...(row.state !== "complete" && row.state !== "initializing"
       ? [
           {
             id: "pause-resume",
@@ -202,7 +214,7 @@
   let menuAnchor = $state<
     { kind: "rect"; el: HTMLElement } | { kind: "point"; x: number; y: number } | null
   >(null);
-  let ellipsisEl: HTMLButtonElement | undefined = $state();
+  let ellipsisEl: HTMLElement | undefined = $state();
 
   function toggleMenuAtEllipsis() {
     if (menuOpen) {
@@ -253,9 +265,9 @@
     "data-[kb-cursor]:bg-raised/50",
   ]}
 >
-  {#if row.state === "initializing"}
-    <!-- Initializing: a skeleton at the exact row dimensions (no layout shift)
-         while the torrent resolves its name + files. -->
+  {#if row.resolving}
+    <!-- Resolving metadata: a skeleton at the exact row dimensions (no layout
+         shift) while the torrent resolves its name + files. -->
     <div class="flex items-center gap-3">
       <div class="flex min-w-0 flex-1 items-center gap-2">
         <div class="size-8 shrink-0 animate-pulse rounded bg-muted/15"></div>
@@ -274,7 +286,9 @@
       <div class="flex shrink-0 items-center gap-0.5">
         <div class="size-7 animate-pulse rounded bg-muted/15"></div>
         <div class="size-7 animate-pulse rounded bg-muted/15"></div>
-        <div class="size-7 animate-pulse rounded bg-muted/15"></div>
+        <!-- Bound so the keyboard menu has an anchor while the row is still a
+             skeleton: a stuck torrent has to stay actionable. -->
+        <div bind:this={ellipsisEl} class="size-7 animate-pulse rounded bg-muted/15"></div>
       </div>
     </div>
   {:else}

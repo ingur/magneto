@@ -29,16 +29,6 @@ export class TorrentsData {
     return this.#details[infoHash];
   }
 
-  // A torrent is ready for file-level ops once its detail is loaded and it is
-  // not (re)initializing. The daemon emits no event for persist/share/pause/
-  // resume, so file/folder targets are gated on this (see actions.gateReady).
-  ready(infoHash: InfoHash): boolean {
-    const summary = daemon.torrents[infoHash];
-    return (
-      summary !== undefined && !summary.is_initializing && this.#details[infoHash] !== undefined
-    );
-  }
-
   // Fetch (or refetch) a torrent's detail and cache it. Called on
   // torrent-open and after persist/share/pause/resume.
   async load(infoHash: InfoHash): Promise<TorrentDetail> {

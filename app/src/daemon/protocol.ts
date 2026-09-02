@@ -9,6 +9,7 @@ export type InfoHash = string;
 export type TorrentState =
   | "initializing"
   | "downloading"
+  | "stalled"
   | "paused"
   | "idle"
   | "complete"
@@ -71,9 +72,13 @@ export interface Config {
 export interface TorrentSummary {
   info_hash: InfoHash;
   name: string | null;
-  source: string | null;
-  source_kind: SourceKind | null;
+  source: string;
+  source_kind: SourceKind;
   state: TorrentState;
+  // Engine error text, present only in the error state.
+  error: string | null;
+  // 0..1 while the engine checks files, null otherwise.
+  check_progress: number | null;
   // Byte fields are bytes; download_speed/upload_speed are bytes per second.
   // total_bytes_all sums all managed (media) files; total_bytes_selected is the
   // selected-for-download subset and the progress denominator.
@@ -87,9 +92,6 @@ export interface TorrentSummary {
   selected_count: number;
   persisted_count: number;
   shared_count: number;
-  is_initializing: boolean;
-  is_complete: boolean;
-  is_seeding: boolean;
   is_paused: boolean;
   added_at: string;
 }
@@ -112,6 +114,7 @@ export interface TorrentDetail extends TorrentSummary {
 export interface DaemonInfo {
   version: string;
   status: string;
+  started_at: string;
   control_port: number;
   lan_port: number;
   upnp_active: boolean;
@@ -120,20 +123,11 @@ export interface DaemonInfo {
 
 // ---- Stats deltas (only changed fields are present) ----
 
-export interface TorrentStatsDelta {
-  info_hash: InfoHash;
-  state?: TorrentState;
-  downloaded_bytes?: number;
-  total_bytes_selected?: number;
-  download_speed?: number; // bytes per second
-  upload_speed?: number; // bytes per second
-  is_paused?: boolean;
-  is_seeding?: boolean;
-  complete_count?: number;
-  selected_count?: number;
-  persisted_count?: number;
-  shared_count?: number;
-}
+// A complete patch of the summary: every field but the key is optional and
+// omitted when unchanged. The nullable fields arrive as an explicit null when
+// cleared, so the patch must be merged as-is, never filtered for nulls.
+export type TorrentStatsDelta = Pick<TorrentSummary, "info_hash"> &
+  Partial<Omit<TorrentSummary, "info_hash">>;
 
 export interface FileStatsDelta {
   info_hash: InfoHash;
@@ -177,13 +171,10 @@ export interface StatsEvent {
   files: FileStatsDelta[];
 }
 
-export interface TorrentAddedEvent {
+export type TorrentAddedEvent = {
   type: "torrent_added";
-  info_hash: InfoHash;
-  source: string;
-  state: TorrentState;
   already_existed: boolean;
-}
+} & TorrentSummary;
 
 export type TorrentReadyEvent = { type: "torrent_ready" } & TorrentDetail;
 

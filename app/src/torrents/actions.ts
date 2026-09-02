@@ -1,9 +1,10 @@
 // Torrent actions: the daemon seam plus the orchestration above it.
 //
 // Two layers, one home:
-//   * Low-level senders map row IDs → Targets, gate file/folder ops on torrent
-//     readiness, send the command, and refetch detail for the no-event
-//     mutations. Private; the run* commands are the surface.
+//   * Low-level senders map row IDs → Targets, send the command, and refetch
+//     detail for the no-event mutations. Private; the run* commands are the
+//     surface. The daemon refuses what it cannot serve (a torrent still
+//     checking its files) and its message is the toast.
 //   * run* commands own the user-facing orchestration (confirm prompt, toast
 //     copy, clear-selection-after-bulk). Mouse (Row) and keyboard (bindings)
 //     both build an ActionTargets and call the same run*: the targeting
@@ -19,7 +20,7 @@ import { toast } from "@/lib/feedback/toasts/toasts.svelte";
 import { data, type FilePatch } from "./data.svelte";
 import { idToInfoHash, idToTarget } from "./ids";
 import { nav } from "./nav.svelte";
-import { targetFiles, type Row } from "./projection";
+import { targetFiles, type Row, type RowState } from "./projection";
 
 // What an action operates on: the resolved target ids, the page rows (for
 // per-target state lookups), the leader row (sets toggle direction / kind
@@ -48,10 +49,12 @@ export function orderBySelection(rows: Row[], selection: ReadonlySet<string>): s
 }
 
 // Keyboard targeting: the marked selection if any, else the cursored row.
+// Marks can outlive their rows (a reconnect refetching the open torrent's
+// detail); with nothing rendered there is nothing to act on.
 export function resolveTargets(): ActionTargets {
   const rows = nav.currentRows;
   const cursorRow = rows.find((r) => r.id === kb.cursor());
-  const bulk = nav.selection.size > 0;
+  const bulk = rows.length > 0 && nav.selection.size > 0;
   const ids = bulk ? orderBySelection(rows, nav.selection) : cursorRow ? [cursorRow.id] : [];
   return { ids, rows, leader: cursorRow, subject: subjectFor(ids, cursorRow), bulk };
 }
@@ -100,14 +103,20 @@ export function downloadRemaining(r: Row): boolean {
   );
 }
 
+// Wanted and either moving, stalled or waiting its turn: the states a pause
+// acts on. Stalled is downloading that receives nothing, not a stop.
+function active(state: RowState): boolean {
+  return state === "downloading" || state === "stalled" || state === "queued";
+}
+
 // The toggle's direction is a function of the targets, not the cursor: if
-// anything targeted is active (downloading, or queued, already wanted),
-// the toggle stops it all; otherwise it starts everything stopped. One press
-// always converges the targets to one coherent state.
+// anything targeted is active (already wanted), the toggle stops it all;
+// otherwise it starts everything stopped. One press always converges the
+// targets to one coherent state.
 export function pauseDirection(t: ActionTargets): boolean {
   return t.ids.some((id) => {
     const s = t.rows.find((row) => row.id === id)?.state;
-    return s === "downloading" || s === "queued";
+    return s !== undefined && active(s);
   });
 }
 
@@ -120,7 +129,7 @@ export async function runToggleDownload(t: ActionTargets): Promise<void> {
     const r = t.rows.find((row) => row.id === id);
     if (!r) return false;
     return isPause
-      ? r.state === "downloading" || r.state === "queued"
+      ? active(r.state)
       : r.state === "paused" || r.state === "idle" || r.state === "error" || downloadRemaining(r);
   });
   if (valid.length === 0) return;
@@ -196,7 +205,8 @@ export async function runReveal(row: Row): Promise<void> {
 
 // Copy a shareable magnet link per targeted torrent (deduped to info_hashes).
 // A magnet-added torrent keeps its original (trackers and all); others get a
-// minimal magnet from the info hash + name.
+// minimal magnet from the info hash + name. The source is checked for content,
+// not just kind: the daemon writes an empty string when it has no source bytes.
 export function buildMagnet(summary: TorrentSummary): string {
   if (summary.source_kind === "magnet" && summary.source) return summary.source;
   const dn = summary.name ? `&dn=${encodeURIComponent(summary.name)}` : "";
@@ -232,19 +242,6 @@ function toTargets(ids: string[]): Target[] {
   return ids.map(idToTarget).filter((t): t is Target => t !== null);
 }
 
-// Drop file/folder targets whose torrent isn't ready (loaded + not
-// reinitializing): the daemon would reject or misapply them, and it pushes
-// no event for the mutations. Torrent targets pass through (root-level ops
-// are valid mid-initialization; the daemon errors clearly if there's nothing
-// to act on).
-function gateReady(ids: string[]): string[] {
-  return ids.filter((id) => {
-    const t = idToTarget(id);
-    if (!t) return false;
-    return t.kind === "torrent" || data.ready(t.info_hash);
-  });
-}
-
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -265,13 +262,8 @@ async function sendTargets(
   ids: string[],
   extra: Record<string, unknown> = {},
 ): Promise<boolean> {
-  const targets = toTargets(gateReady(ids));
-  if (targets.length === 0) {
-    // All file/folder targets gated as not-ready: say why nothing happened
-    // (loading vs broken) instead of a silent no-op.
-    if (ids.length > 0) toast.warn("Torrent still loading");
-    return false;
-  }
+  const targets = toTargets(ids);
+  if (targets.length === 0) return false;
   try {
     await daemon.request(command, { targets, ...extra });
     return true;
@@ -293,11 +285,8 @@ async function sendAffected(
   ids: string[],
   extra: Record<string, unknown> = {},
 ): Promise<boolean> {
-  const targets = toTargets(gateReady(ids));
-  if (targets.length === 0) {
-    if (ids.length > 0) toast.warn("Torrent still loading");
-    return false;
-  }
+  const targets = toTargets(ids);
+  if (targets.length === 0) return false;
   try {
     const resp = await daemon.request<AffectedResp>(command, { targets, ...extra });
     if (resp.affected > 0) await refetchAffected(ids);

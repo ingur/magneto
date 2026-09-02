@@ -5,10 +5,12 @@
 import type { Row, RowState } from "./projection";
 import type { SortMode } from "./types";
 
-// Status sort groups by activity: actively moving first, settled last. Queued
-// sits just behind downloading (wanted and pending), ahead of paused/idle.
+// Status sort groups by activity: actively moving first, settled last. Stalled
+// is downloading that receives nothing and ranks with it; queued sits just
+// behind (wanted and pending), ahead of paused/idle.
 const STATE_RANK: Record<RowState, number> = {
   downloading: 0,
+  stalled: 0,
   queued: 1,
   paused: 2,
   idle: 3,

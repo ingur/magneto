@@ -2,26 +2,21 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use serde::de::DeserializeOwned;
 use tokio_tungstenite::tungstenite::Message;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-
-pub async fn run_command<T: DeserializeOwned>(
-    port: u16,
-    command: &str,
-    payload: serde_json::Value,
-    token: Option<&str>,
-) -> Result<T> {
-    let value = run_raw(port, command, payload, token).await?;
-    serde_json::from_value(value).context("deserializing daemon response")
-}
+/// How long the daemon gives add_torrent to resolve a source's metadata
+/// before it answers with an error. Clients wait past it so the daemon's own
+/// verdict is what they report.
+pub const ADD_TIMEOUT: Duration = Duration::from_secs(120);
+pub const ADD_REQUEST_TIMEOUT: Duration = Duration::from_secs(ADD_TIMEOUT.as_secs() + 5);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub async fn run_raw(
     port: u16,
     command: &str,
     payload: serde_json::Value,
     token: Option<&str>,
+    timeout: Duration,
 ) -> Result<serde_json::Value> {
     // The control token is a fixed-length hex string (URL-safe), so it is
     // interpolated directly rather than percent-encoded.
@@ -73,7 +68,33 @@ pub async fn run_raw(
         }
     };
 
-    tokio::time::timeout(REQUEST_TIMEOUT, fut)
+    tokio::time::timeout(timeout, fut)
         .await
-        .context("daemon did not respond within 15s")?
+        .with_context(|| format!("daemon did not respond within {}s", timeout.as_secs()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clients_outlast_the_daemon_add_budget() {
+        assert!(ADD_REQUEST_TIMEOUT > ADD_TIMEOUT);
+        assert!(REQUEST_TIMEOUT < ADD_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn run_raw_gives_up_at_the_deadline_it_was_given() {
+        // A listener that accepts and then never answers the handshake.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let err = run_raw(port, "ping", serde_json::json!({}), None, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "daemon did not respond within 1s");
+    }
 }

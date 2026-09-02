@@ -177,6 +177,31 @@
     void tick().then(() => kb.setCursorOn(h, target));
   });
 
+  // A cursored row that leaves the list (deleted, dropped) hands the cursor to
+  // the row that followed it in the visible order, else the one before. Runs
+  // before the DOM updates so the row unmounts without the cursor on it; the
+  // engine's own clamp can only fall back to the top of the list.
+  let lastIds: string[] = [];
+  $effect.pre(() => {
+    const ids = rows.map((r) => r.id);
+    const h = handle;
+    untrack(() => {
+      const cursor = h ? kb.cursorOn(h) : null;
+      const at = cursor !== null && !ids.includes(cursor) ? lastIds.indexOf(cursor) : -1;
+      if (h && at !== -1) {
+        const next = nearestKept(lastIds, at, new Set(ids));
+        if (next !== undefined) kb.setCursorOn(h, next);
+      }
+      lastIds = ids;
+    });
+  });
+
+  function nearestKept(before: string[], at: number, kept: Set<string>): string | undefined {
+    for (let i = at + 1; i < before.length; i++) if (kept.has(before[i])) return before[i];
+    for (let i = at - 1; i >= 0; i--) if (kept.has(before[i])) return before[i];
+    return undefined;
+  }
+
   useScrollFollowCursor(() => handle);
 </script>
 

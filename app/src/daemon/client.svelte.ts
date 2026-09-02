@@ -17,7 +17,7 @@ export type ConnStatus = "connecting" | "connected" | "reconnecting" | "disconne
 
 const REQUEST_TIMEOUT = 15_000;
 // add_torrent defers its reply until librqbit resolves magnet metadata, under
-// a 120s daemon watchdog (ADD_TIMEOUT in commands.rs). Sized above it so the
+// a 120s daemon watchdog (ADD_TIMEOUT in core/src/client.rs). Sized above it so the
 // daemon's real success/failure always lands before the client gives up.
 export const ADD_REQUEST_TIMEOUT = 125_000;
 const PING_INTERVAL = 20_000;
@@ -201,6 +201,9 @@ export class DaemonClient {
       this.#ws = null;
       this.#clearTimers();
       this.#rejectAllPending(new Error("connection closed"));
+      // Speeds are rates we can no longer observe; without this the last
+      // reading (and its ETA) sits in every row for the whole outage.
+      for (const t of Object.values(this.torrents)) t.download_speed = t.upload_speed = 0;
       if (this.#intentional) {
         this.status = "disconnected";
       } else {
@@ -255,9 +258,8 @@ export class DaemonClient {
         break;
       }
       case "torrent_added": {
-        if (!this.torrents[event.info_hash]) {
-          this.torrents[event.info_hash] = placeholderSummary(event.info_hash, event.state);
-        }
+        const { type: _type, already_existed: _existed, ...summary } = event;
+        this.torrents[event.info_hash] = summary;
         break;
       }
       case "torrent_ready": {
@@ -265,23 +267,8 @@ export class DaemonClient {
         this.torrents[event.info_hash] = summary;
         break;
       }
-      case "torrent_complete": {
-        const current = this.torrents[event.info_hash];
-        const wasComplete = current?.state === "complete";
-        if (current) current.state = "complete";
-        // Skip relaying a re-emit: the daemon re-broadcasts complete for every
-        // already-complete torrent on restart, and a reconnect snapshot already
-        // marks them complete; only a real incomplete→complete edge should toast.
-        if (wasComplete) return;
-        break;
-      }
       case "torrent_removed": {
         delete this.torrents[event.info_hash];
-        break;
-      }
-      case "torrent_error": {
-        const current = this.torrents[event.info_hash];
-        if (current) current.state = "error";
         break;
       }
       case "config_changed": {
@@ -338,34 +325,6 @@ export class DaemonClient {
     }
     this.#pending.clear();
   }
-}
-
-function placeholderSummary(infoHash: InfoHash, state: TorrentSummary["state"]): TorrentSummary {
-  return {
-    info_hash: infoHash,
-    name: null,
-    source: null,
-    source_kind: null,
-    state,
-    total_bytes_all: 0,
-    total_bytes_selected: 0,
-    downloaded_bytes: 0,
-    download_speed: 0,
-    upload_speed: 0,
-    file_count: 0,
-    complete_count: 0,
-    selected_count: 0,
-    persisted_count: 0,
-    shared_count: 0,
-    is_initializing: state === "initializing",
-    is_complete: false,
-    is_seeding: false,
-    is_paused: false,
-    // Real timestamp (not "") so the "added" sort places a just-added torrent
-    // correctly instead of treating it as undated; the daemon's added_at
-    // replaces it on the next snapshot/torrent_ready.
-    added_at: new Date().toISOString(),
-  };
 }
 
 export const daemon = new DaemonClient();

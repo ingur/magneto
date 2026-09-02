@@ -10,6 +10,7 @@ import { untrack } from "svelte";
 import { SvelteSet } from "svelte/reactivity";
 
 import { daemon } from "@/daemon/client.svelte";
+import type { TorrentDetail } from "@/daemon/protocol";
 import { data } from "./data.svelte";
 import { idToInfoHash, idToTarget } from "./ids";
 import {
@@ -80,9 +81,7 @@ class TorrentsNav {
     if (this.pathIds.length === 0) {
       return sortRows(projectRoot(daemon.torrentList), this.sortMode);
     }
-    const infoHash = idToInfoHash(this.pathIds[0]);
-    if (!infoHash) return [];
-    const detail = data.detail(infoHash);
+    const detail = this.#openDetail();
     if (!detail) return []; // open in flight, get_torrent pending
     return sortRows(projectFolder(detail, this.#folderPath()), this.sortMode);
   });
@@ -122,8 +121,11 @@ class TorrentsNav {
   // reconnect). IGNORES the active filter: a committed filter's marks must
   // survive a query that scrolls them out of the fuzzy results; only a
   // truly-gone row is pruned (selection resets on filter exit anyway).
+  // Inside a torrent whose detail is not loaded (a reconnect wiped it and the
+  // refetch is in flight) the scope is unknown, not empty: the marks wait.
   pruneStaleMarks() {
     if (this.selection.size === 0) return;
+    if (this.pathIds.length > 0 && !this.#openDetail()) return;
     const scope = this.filter.active && this.filter.query !== "" ? this.#filterSource() : null;
     const live = new Set(scope ? scope.map((e) => e.row.id) : this.currentRows.map((r) => r.id));
     for (const id of [...this.selection]) if (!live.has(id)) this.selection.delete(id);
@@ -202,11 +204,15 @@ class TorrentsNav {
   // Flat candidate set for the active filter, scoped to the current position.
   #filterSource(): FilterEntry[] {
     if (this.pathIds.length === 0) return rootSource(daemon.torrentList);
-    const infoHash = idToInfoHash(this.pathIds[0]);
-    if (!infoHash) return [];
-    const detail = data.detail(infoHash);
+    const detail = this.#openDetail();
     if (!detail) return [];
     return folderSource(detail, this.#folderPath());
+  }
+
+  // The loaded detail of the open torrent, if any.
+  #openDetail(): TorrentDetail | undefined {
+    const infoHash = this.pathIds.length > 0 ? idToInfoHash(this.pathIds[0]) : null;
+    return infoHash ? data.detail(infoHash) : undefined;
   }
 
   // Torrent-internal folder path of the current page ("" at the torrent
