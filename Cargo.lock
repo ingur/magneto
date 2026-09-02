@@ -3267,7 +3267,7 @@ dependencies = [
 
 [[package]]
 name = "magneto-app"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3291,7 +3291,7 @@ dependencies = [
 
 [[package]]
 name = "magneto-cli"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3303,7 +3303,7 @@ dependencies = [
 
 [[package]]
 name = "magneto-core"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "directories",
@@ -3318,7 +3318,7 @@ dependencies = [
 
 [[package]]
 name = "magneto-daemon"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "axum",
