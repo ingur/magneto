@@ -91,4 +91,34 @@ in
   scripts.build-windows.exec = ''
     cargo build --release --target x86_64-pc-windows-gnu "$@"
   '';
+
+  # Run a release build against its own config, data and downloads, so testing
+  # cannot touch the installed Magneto. Ports differ too, so both can run.
+  scripts.sandbox.exec = ''
+    set -euo pipefail
+    root="''${MAGNETO_SANDBOX:-/tmp/magneto-sandbox}"
+
+    if pgrep -x magneto-app >/dev/null; then
+      echo "magneto-app is already running: quit it first, or single-instance will" >&2
+      echo "forward this launch to it and exit (both share the app identifier)." >&2
+      exit 1
+    fi
+
+    mkdir -p "$root"/{config/magneto,data,cache,downloads}
+    if [ ! -f "$root/config/magneto/config.toml" ]; then
+      printf '[network]\ncontrol_port = 61581\nlan_port = 61582\n\n[downloads]\ndir = "%s/downloads"\n' \
+        "$root" > "$root/config/magneto/config.toml"
+    fi
+
+    app=target/release/magneto-app
+    if [ ! -x "$app" ] || [ "''${1:-}" = "--build" ]; then
+      pnpm -C app tauri build --no-bundle
+    fi
+
+    echo "sandbox root: $root"
+    XDG_CONFIG_HOME="$root/config" \
+    XDG_DATA_HOME="$root/data" \
+    XDG_CACHE_HOME="$root/cache" \
+      exec "$app"
+  '';
 }
