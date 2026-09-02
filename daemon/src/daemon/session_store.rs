@@ -20,7 +20,7 @@ pub fn session_dir(data_dir: &Path) -> PathBuf {
 /// then discards data that is on disk.
 pub fn sync_bitfield(data_dir: &Path, info_hash: &str) {
     let path = session_dir(data_dir).join(format!("{info_hash}.bitv"));
-    match std::fs::File::open(&path) {
+    match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
         Ok(f) => {
             if let Err(e) = f.sync_all() {
                 warn!(error = %e, path = %path.display(), "failed to flush fastresume bitfield");
@@ -63,7 +63,11 @@ struct Row {
 
 impl Row {
     fn parse(row: &Value) -> Option<Self> {
-        serde_json::from_value(row.clone()).ok()
+        let row: Self = serde_json::from_value(row.clone()).ok()?;
+        // The hash names the sidecar files, so anything but a hex id20 is junk.
+        let hex = row.info_hash.len() == 40
+            && row.info_hash.bytes().all(|b| b.is_ascii_hexdigit());
+        hex.then_some(row)
     }
 }
 
@@ -99,7 +103,9 @@ pub fn repair(data_dir: &Path) {
     // that does not match its shape is dropped like one with no torrent file.
     let mut doomed: Vec<String> = Vec::new();
     for (id, row) in rows.iter() {
-        let Some(row) = Row::parse(row) else {
+        // The engine keys this map by torrent id, so a non-numeric key fails it
+        // as surely as a malformed row.
+        let Some(row) = id.parse::<usize>().ok().and(Row::parse(row)) else {
             doomed.push(id.clone());
             continue;
         };
@@ -233,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn row_shape_matches_the_engine() {
+    fn engine_row_shape_is_accepted() {
         let row = Row::parse(&healthy()).expect("healthy row parses");
         assert_eq!(row.info_hash.len(), 40);
         assert_eq!(row.output_folder, PathBuf::from("/downloads/Show.S01"));
@@ -244,9 +250,10 @@ mod tests {
     }
 
     #[test]
-    fn malformed_rows_are_rejected() {
+    fn junk_rows_are_rejected() {
         for (field, value) in [
             ("info_hash", Value::from(42)),
+            ("info_hash", Value::from("nothex")),
             ("output_folder", Value::from(7)),
             ("trackers", Value::from("not-a-list")),
             ("only_files", Value::from("all")),

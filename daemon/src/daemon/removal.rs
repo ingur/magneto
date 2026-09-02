@@ -18,15 +18,12 @@ use crate::daemon::session::TorrentHandle;
 use crate::daemon::{Daemon, short};
 use crate::metadata::TorrentMetadata;
 
-/// What happens to the bytes on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Files {
-    /// Leave every byte where it is.
     Keep,
-    /// Delete the files magneto selected, plus the empty ones the engine created
-    /// for the rest. Bytes that were on disk before the add stay.
+    /// magneto's own: the file map, its selected subtitles, and the empty files
+    /// the engine created for the rest. Bytes from before the add stay.
     Managed,
-    /// Delete every file in the torrent.
     All,
 }
 
@@ -35,7 +32,6 @@ pub fn disposable(entry: &TorrentMetadata) -> bool {
     entry.finalized && !entry.files.is_empty() && !entry.files.values().any(|f| f.persisted)
 }
 
-/// Drop a torrent from the session and from everything magneto tracks.
 pub async fn remove(
     daemon: &mut Daemon,
     info_hash: &str,
@@ -70,14 +66,10 @@ pub async fn remove(
         warn!(hash = %short(info_hash), error = %e, "engine delete failed after the torrent left the session");
     }
     crate::daemon::session_store::forget(&daemon.data_dir, info_hash);
-    {
-        let mut meta = daemon.metadata.write();
-        meta.remove(info_hash);
-        if let Err(e) = meta.save(&daemon.metadata_path) {
-            warn!(hash = %short(info_hash), error = %e, "metadata save failed after removal");
-        }
-    }
+    daemon.metadata.write().remove(info_hash);
+    let _ = daemon.save_metadata();
     daemon.rechecked.remove(info_hash);
+    daemon.checks.remove(info_hash);
     if files == Files::Managed {
         reclaim(&handle, &doomed, &daemon.started.downloads.dir);
     }
@@ -157,4 +149,43 @@ fn managed_indices(daemon: &Daemon, handle: &TorrentHandle, info_hash: &str) -> 
     out.extend(empty);
     out.sort_unstable();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use chrono::Utc;
+
+    use super::*;
+    use magneto_core::protocol::SourceKind;
+
+    use crate::metadata::FileMetadata;
+
+    fn entry(finalized: bool, files: &[(u32, bool)]) -> TorrentMetadata {
+        TorrentMetadata {
+            source: "magnet:?xt=urn:btih:aa".into(),
+            source_kind: SourceKind::Magnet,
+            added_at: Utc::now(),
+            files: files
+                .iter()
+                .map(|(idx, persisted)| {
+                    (*idx, FileMetadata { persisted: *persisted, shared: false, paused: false })
+                })
+                .collect::<BTreeMap<_, _>>(),
+            finalized,
+        }
+    }
+
+    #[test]
+    fn only_a_finished_record_with_nothing_kept_is_disposable() {
+        assert!(disposable(&entry(true, &[(0, false), (1, false)])));
+        // One file the user asked to keep protects the whole torrent.
+        assert!(!disposable(&entry(true, &[(0, true), (1, false)])));
+        // An add that never classified, and a record rebuilt after a bad read,
+        // both look like "nothing kept" and must not.
+        assert!(!disposable(&entry(false, &[])));
+        assert!(!disposable(&entry(false, &[(0, false)])));
+        assert!(!disposable(&entry(true, &[])));
+    }
 }

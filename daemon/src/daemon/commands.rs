@@ -6,7 +6,7 @@ use base64::Engine;
 use librqbit::{TorrentStats, TorrentStatsState};
 use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use magneto_core::config::Config;
 use crate::daemon::preflight;
@@ -178,12 +178,13 @@ pub(crate) async fn finish_add(
     // recovery attempt even if the automatic one is spent.
     daemon.rechecked.remove(&info_hash);
 
-    let (state, source) = {
+    let (state, source, finalized) = {
         let meta = daemon.metadata.read();
         let entry = meta.get(&info_hash);
         (
             render_torrent_summary(&handle, entry, &daemon.config).state,
             entry.map(|e| e.source.clone()).unwrap_or_default(),
+            entry.is_some_and(|e| e.finalized),
         )
     };
     daemon.broadcast(Outbound::TorrentAdded(TorrentAddedEvent {
@@ -204,7 +205,9 @@ pub(crate) async fn finish_add(
         fallback_launched: outcome.fallback_launched,
         fallback_reason: outcome.fallback_reason,
     };
-    if already_existed {
+    // A torrent whose record was not applied yet gets its autoplay from the
+    // finalize above, so only an already settled one needs it here.
+    if already_existed && finalized {
         try_autoplay_on_readd(daemon, &handle, &resp).await;
     }
     Outbound::response(id, resp)
@@ -240,19 +243,23 @@ async fn try_autoplay_on_readd(daemon: &Daemon, handle: &TorrentHandle, resp: &A
     }
 }
 
-/// Where a finalize came from. An add follows the auto_download setting. A
-/// torrent the daemon re-added at boot lost its engine-side state, so it comes
-/// back paused with nothing selected: only the user knows whether it should be
-/// downloading again.
+/// Where a finalize came from, which decides how much of it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Finalize {
+    /// The user just added it: apply the auto_download setting and autoplay.
     Add,
+    /// Startup found a record whose add never finished: apply the setting, but
+    /// nothing launches a player at boot.
+    Boot,
+    /// The engine already holds this torrent's state, or the daemon re-added it
+    /// paused with nothing selected. Only the user knows whether it should be
+    /// downloading again, so no selection is written.
     Restore,
 }
 
 /// Bring the engine and magneto's record in step for one torrent, then tell the
 /// clients. Safe to call more than once: the engine side runs only while the
-/// record says it has not been applied yet.
+/// record is not finalized yet.
 pub(crate) async fn finalize_torrent(
     daemon: &mut Daemon,
     info_hash: &str,
@@ -313,7 +320,7 @@ async fn finalize_inner(daemon: &mut Daemon, info_hash: &str, from: Finalize) ->
     let Some(subs) = classify(daemon, info_hash).await else {
         return FinalizeOutcome::pending(TorrentState::Initializing);
     };
-    let (media, applied) = {
+    let (media, finalized) = {
         let meta = daemon.metadata.read();
         match meta.get(info_hash) {
             Some(entry) => (entry.files.keys().copied().collect::<Vec<u32>>(), entry.finalized),
@@ -323,7 +330,7 @@ async fn finalize_inner(daemon: &mut Daemon, info_hash: &str, from: Finalize) ->
     if media.is_empty() {
         return drop_without_media(daemon, info_hash).await;
     }
-    if !applied {
+    if !finalized {
         apply_engine_policy(daemon, info_hash, &media, &subs, from).await;
     }
     let meta = daemon.metadata.read();
@@ -396,7 +403,7 @@ async fn classify(daemon: &mut Daemon, info_hash: &str) -> Option<Vec<u32>> {
         }
     };
     if unknown || mapped {
-        save_metadata(daemon);
+        let _ = daemon.save_metadata();
     }
     Some(subs)
 }
@@ -441,7 +448,7 @@ async fn apply_engine_policy(
     subs: &[u32],
     from: Finalize,
 ) {
-    if from == Finalize::Add {
+    if from != Finalize::Restore {
         let select: HashSet<usize> = if daemon.config.downloads.auto_download {
             media.iter().chain(subs.iter()).map(|i| *i as usize).collect()
         } else {
@@ -453,9 +460,16 @@ async fn apply_engine_policy(
             warn!(hash = %short(info_hash), error = %e, "selection failed during finalize");
             return;
         }
-        if !select.is_empty()
-            && let Err(e) = daemon.session.unpause_if_paused(info_hash).await
-        {
+        if select.is_empty() {
+            // A recovery unpaused it to force the re-check, so it can be live
+            // with nothing to do. Idle and paused is the honest shape.
+            if let Some(handle) = daemon.session.get(info_hash)
+                && matches!(handle.stats().state, TorrentStatsState::Live)
+                && let Err(e) = daemon.session.pause(info_hash).await
+            {
+                warn!(hash = %short(info_hash), error = %e, "pause after finalize failed");
+            }
+        } else if let Err(e) = daemon.session.unpause_if_paused(info_hash).await {
             warn!(hash = %short(info_hash), error = %e, "unpause failed during finalize");
         }
     }
@@ -465,7 +479,7 @@ async fn apply_engine_policy(
             entry.finalized = true;
         }
     }
-    save_metadata(daemon);
+    let _ = daemon.save_metadata();
 
     if from == Finalize::Add
         && daemon.config.downloads.autoplay
@@ -527,7 +541,12 @@ async fn drop_without_media(daemon: &mut Daemon, info_hash: &str) -> FinalizeOut
 /// bitfield and check again.
 pub(crate) async fn recover_errored(daemon: &mut Daemon, info_hash: &str, from: Finalize) {
     let handle = daemon.session.get(info_hash);
-    let error = handle.as_ref().and_then(|h| h.stats().error);
+    let stats = handle.as_ref().map(|h| h.stats());
+    if !stats.as_ref().is_some_and(|s| matches!(s.state, TorrentStatsState::Error)) {
+        // Something already fixed it between the report and now.
+        return;
+    }
+    let error = stats.and_then(|s| s.error);
     if !daemon.rechecked.insert(info_hash.to_string()) {
         if let Some(error) = error {
             daemon.broadcast(Outbound::TorrentError { info_hash: info_hash.to_string(), error });
@@ -549,15 +568,10 @@ pub(crate) async fn recover_errored(daemon: &mut Daemon, info_hash: &str, from: 
 /// Whether a recovered torrent goes back to paused once its check finishes.
 /// Every add starts paused so its selection lands first, so an add's pause flag
 /// says nothing about intent. Only a restore carries intent worth keeping.
-fn keep_paused(from: Finalize, engine_paused: bool) -> bool {
-    from == Finalize::Restore && engine_paused
+fn keep_paused(from: Finalize, intent_paused: bool) -> bool {
+    from == Finalize::Restore && intent_paused
 }
 
-fn save_metadata(daemon: &Daemon) {
-    if let Err(e) = daemon.metadata.read().save(&daemon.metadata_path) {
-        error!(error = %e, "failed to save metadata");
-    }
-}
 
 // ---- reconcile ----
 
@@ -573,16 +587,19 @@ pub async fn reconcile(daemon: &mut Daemon) {
         if in_session.contains(&hash) {
             continue;
         }
+        let saved = crate::metadata::torrent_file_path(&daemon.data_dir, &hash);
         match restore_torrent(daemon, &hash).await {
             Ok(()) => info!(hash = %short(&hash), "re-added torrent missing from the engine"),
-            Err(e) => {
-                // Nothing left to re-add from, so the record goes. The data on
-                // disk stays: it is not ours to delete without a record saying
-                // so.
-                warn!(hash = %short(&hash), error = %e, "forgetting torrent with no usable torrent file");
+            Err(e) if !saved.exists() => {
+                // Nothing to re-add from. The data on disk stays: it is not ours
+                // to delete without a record saying so.
+                warn!(hash = %short(&hash), error = %e, "forgetting torrent with no saved torrent file");
                 daemon.metadata.write().remove(&hash);
-                crate::metadata::delete_torrent_bytes(&daemon.data_dir, &hash);
             }
+            // The bytes are still there, so the record stays and the next boot
+            // tries again. A rejected metainfo or a busy engine must not cost
+            // the user their only way back to this data.
+            Err(e) => warn!(hash = %short(&hash), error = %e, "could not re-add torrent; keeping its record"),
         }
     }
 
@@ -598,9 +615,17 @@ pub async fn reconcile(daemon: &mut Daemon) {
     }
     let hashes: Vec<String> = daemon.session.list_infohashes();
     for hash in hashes {
-        finalize_torrent(daemon, &hash, Finalize::Restore).await;
+        // Only a record whose add never classified takes the add policy: any
+        // other torrent already has a selection that is not ours to rewrite.
+        let unfinished = daemon
+            .metadata
+            .read()
+            .get(&hash)
+            .is_some_and(|entry| entry.files.is_empty());
+        let from = if unfinished { Finalize::Boot } else { Finalize::Restore };
+        finalize_torrent(daemon, &hash, from).await;
     }
-    save_metadata(daemon);
+    let _ = daemon.save_metadata();
     info!("reconciliation complete");
 }
 
@@ -664,7 +689,7 @@ pub async fn cleanup_unpersisted(daemon: &mut Daemon) {
         }
         info!(hash = %short(&hash), dropped = dropped.len(), "cleanup: reclaimed files");
     }
-    save_metadata(daemon);
+    let _ = daemon.save_metadata();
 }
 
 // ---- mutation handlers ----
@@ -768,19 +793,19 @@ async fn handle_pause(daemon: &mut Daemon, id: String, req: TargetsReq) -> Outbo
             }
             // Record the pause intent so the file reads as Paused rather than
             // Idle while it sits deselected with its bytes on disk.
-            set_paused_flag(&daemon.metadata, &daemon.metadata_path, &info_hash, &expanded, true);
+            set_paused_flag(&daemon.metadata, &info_hash, &expanded, true);
             affected += expanded.len() as u32;
         }
+        let _ = daemon.save_metadata();
     }
     Outbound::response(id, AffectedResp { affected })
 }
 
-/// Set or clear the per-file pause intent for `indices`, then persist. A
-/// missing torrent or file entry is skipped silently. The only effect is on
-/// the displayed Paused-vs-Idle state, never on download behavior.
+/// Set or clear the per-file pause intent for `indices`. A missing torrent or
+/// file entry is skipped silently. The only effect is on the displayed
+/// Paused-vs-Idle state, never on download behavior.
 fn set_paused_flag(
     metadata: &RwLock<MetadataStore>,
-    metadata_path: &Path,
     info_hash: &str,
     indices: &[u32],
     paused: bool,
@@ -793,7 +818,6 @@ fn set_paused_flag(
             }
         }
     }
-    let _ = meta.save(metadata_path);
 }
 
 /// Next `only_files` after removing `expanded` from a torrent's current
@@ -842,7 +866,6 @@ async fn handle_drop_targets(daemon: &mut Daemon, id: String, req: TargetsReq) -
             warn!(hash = %short(&info_hash), error = %e, "drop update_only_files failed");
             continue;
         }
-        // Deselected above; now free the bytes, the only difference from pause.
         removal::reclaim(&handle, &freed, &daemon.started.downloads.dir);
         let now_empty = {
             let mut meta = daemon.metadata.write();
@@ -851,8 +874,10 @@ async fn handle_drop_targets(daemon: &mut Daemon, id: String, req: TargetsReq) -
             }
             meta.get(&info_hash).map(|e| e.files.is_empty()).unwrap_or(true)
         };
-        save_metadata(daemon);
         affected += expanded.len() as u32;
+        if !now_empty {
+            let _ = daemon.save_metadata();
+        }
         if now_empty {
             // Dropping the last media file empties the torrent, so it goes
             // rather than lingering as a husk. The bytes magneto wrote for the
@@ -892,14 +917,8 @@ async fn handle_resume(daemon: &mut Daemon, id: String, req: TargetsReq) -> Outb
             initializing += 1;
             continue;
         }
-        if let Err(e) = select_for_resume(
-            &daemon.session,
-            &daemon.metadata,
-            &daemon.metadata_path,
-            &info_hash,
-            &expanded,
-        )
-        .await
+        if let Err(e) =
+            select_for_resume(&daemon.session, &daemon.metadata, &info_hash, &expanded).await
         {
             warn!(hash = %short(&info_hash), error = %e, "resume selection failed");
             continue;
@@ -922,6 +941,7 @@ async fn handle_resume(daemon: &mut Daemon, id: String, req: TargetsReq) -> Outb
         }
         affected += expanded.len() as u32;
     }
+    let _ = daemon.save_metadata();
     if affected == 0 && initializing > 0 {
         return Outbound::error(id, "torrent is still checking files; try again shortly");
     }
@@ -989,7 +1009,6 @@ fn resume_groups(
 pub(crate) async fn select_for_resume(
     session: &SessionHandle,
     metadata: &RwLock<MetadataStore>,
-    metadata_path: &Path,
     info_hash: &str,
     targets: &[u32],
 ) -> anyhow::Result<()> {
@@ -1011,14 +1030,14 @@ pub(crate) async fn select_for_resume(
         .collect();
     let mut next: HashSet<usize> =
         if session::engine_paused(&stats.state) && !rest_paused.is_empty() {
-            set_paused_flag(metadata, metadata_path, info_hash, &rest_paused, true);
+            set_paused_flag(metadata, info_hash, &rest_paused, true);
             added
         } else {
             current.union(&added).copied().collect()
         };
     next.extend(subs.iter().map(|i| *i as usize));
     session.update_only_files(info_hash, &next).await?;
-    set_paused_flag(metadata, metadata_path, info_hash, targets, false);
+    set_paused_flag(metadata, info_hash, targets, false);
     Ok(())
 }
 
@@ -1043,7 +1062,11 @@ async fn handle_set_persist(
                 }
             }
         }
-        let _ = meta.save(&daemon.metadata_path);
+    }
+    // These flags are the only thing standing between the user's files and the
+    // cleanup pass, so a failed write is the client's business.
+    if let Err(e) = daemon.save_metadata() {
+        return Outbound::error(id, format!("could not record what to keep: {e}"));
     }
     Outbound::response(id, AffectedResp { affected })
 }
@@ -1065,8 +1088,8 @@ async fn handle_set_shared(daemon: &mut Daemon, id: String, req: SetSharedReq) -
                 }
             }
         }
-        let _ = meta.save(&daemon.metadata_path);
     }
+    let _ = daemon.save_metadata();
     Outbound::response(id, AffectedResp { affected })
 }
 

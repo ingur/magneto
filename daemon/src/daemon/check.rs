@@ -8,26 +8,51 @@
 use std::time::Duration;
 
 use librqbit::TorrentStatsState;
-use tracing::debug;
 
 use crate::daemon::commands::Finalize;
-use crate::daemon::{Daemon, DaemonEvent, short};
+use crate::daemon::{Daemon, DaemonEvent};
 
 const POLL: Duration = Duration::from_millis(500);
 
+/// What to do with a torrent once its check ends. Held by the daemon so a
+/// second waiter is never spawned for the same torrent, and so the decision
+/// survives a waiter that outlives the torrent it was started for.
+#[derive(Debug, Clone, Copy)]
+pub struct Pending {
+    pub from: Finalize,
+    pub repause: bool,
+}
+
 /// Hand `info_hash` back to the event loop once it stops checking files, in
-/// whatever state that leaves it. Ends quietly if the torrent is removed or the
-/// daemon shuts down. A check the user pauses stays Initializing with no check
-/// running, and this keeps waiting: resuming restarts it, and finalizing then is
-/// exactly right.
-pub fn spawn(daemon: &Daemon, info_hash: &str, from: Finalize, repause: bool) {
+/// whatever state that leaves it. A check the user pauses stays Initializing
+/// with no check running, so this keeps waiting: resuming restarts it, and
+/// finalizing then is exactly right.
+///
+/// Calling this again for a torrent already being waited on only sharpens the
+/// pending decision, so a re-add during a boot check still applies the add
+/// policy.
+pub fn spawn(daemon: &mut Daemon, info_hash: &str, from: Finalize, repause: bool) {
+    if let Some(pending) = daemon.checks.get_mut(info_hash) {
+        if from == Finalize::Add {
+            pending.from = Finalize::Add;
+        }
+        pending.repause |= repause;
+        return;
+    }
+    daemon.checks.insert(info_hash.to_string(), Pending { from, repause });
+
     let session = daemon.session.clone();
     let inbox = daemon.inbox_tx.clone();
     let cancel = daemon.cancel.clone();
     let info_hash = info_hash.to_string();
     tokio::spawn(async move {
+        let Some(id) = session.get(&info_hash).map(|h| h.id()) else { return };
         loop {
-            let Some(handle) = session.get(&info_hash) else { return };
+            // A torrent removed and re-added under the same hash is a different
+            // torrent, and its own finalize owns it.
+            let Some(handle) = session.get(&info_hash).filter(|h| h.id() == id) else {
+                return;
+            };
             if !matches!(handle.stats().state, TorrentStatsState::Initializing { .. }) {
                 break;
             }
@@ -36,7 +61,6 @@ pub fn spawn(daemon: &Daemon, info_hash: &str, from: Finalize, repause: bool) {
                 _ = tokio::time::sleep(POLL) => {}
             }
         }
-        debug!(hash = %short(&info_hash), "file check finished");
-        let _ = inbox.send(DaemonEvent::CheckFinished { info_hash, from, repause }).await;
+        let _ = inbox.send(DaemonEvent::CheckFinished { info_hash }).await;
     });
 }

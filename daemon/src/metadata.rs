@@ -46,9 +46,9 @@ pub struct FileMetadata {
 
 impl MetadataStore {
     /// Load the store, replacing an unreadable one with a fresh store and a
-    /// `.bak` copy of what was there. Callers cannot tell the two apart on
-    /// purpose: a store with no entry for a torrent says nothing about it, and
-    /// nothing may be deleted on that basis.
+    /// `.bak` copy of what was there. Missing and unreadable are deliberately
+    /// indistinguishable to callers: a store with no entry for a torrent says
+    /// nothing about it, and nothing may be deleted on that basis.
     pub fn load_or_create(path: &Path) -> Result<Self> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -112,10 +112,9 @@ pub fn save_torrent_bytes(data_dir: &Path, info_hash: &str, bytes: &[u8]) -> Res
     Ok(path)
 }
 
-/// Publish bytes so a crash leaves either the old file or the new one: write a
-/// temp file, fsync it, rename, then fsync the directory. Both metadata.json and
-/// the saved `.torrent` copies are recovery authority, so a torn write of either
-/// costs the user data.
+/// Publish bytes so a crash leaves either the old file or the new one. Both
+/// metadata.json and the saved `.torrent` copies are recovery authority, so a
+/// torn write of either costs the user data.
 pub fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path.parent();
     if let Some(parent) = parent {

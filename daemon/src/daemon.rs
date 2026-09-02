@@ -46,8 +46,8 @@ pub enum DaemonEvent {
     // A torrent the engine put in the error state, seen by the stats tick.
     TorrentErrored { info_hash: String },
     // A torrent finished checking its files, so the engine side of finalizing
-    // can run now.
-    CheckFinished { info_hash: String, from: commands::Finalize, repause: bool },
+    // can run now. What to do with it is in `Daemon::checks`.
+    CheckFinished { info_hash: String },
     // A spawned add_torrent finished (or timed out); carries everything needed
     // to finalize the torrent and answer the requesting client.
     AddCompleted {
@@ -84,6 +84,8 @@ pub struct Daemon {
     // Torrents already re-checked after an engine error this run, so a failing
     // check cannot loop.
     pub rechecked: HashSet<String>,
+    // Torrents whose file check is being waited on, and what to do when it ends.
+    pub checks: HashMap<String, check::Pending>,
     pub control_task: Option<JoinHandle<()>>,
     pub lan_task: Option<JoinHandle<()>>,
     pub upnp_ssdp: Option<JoinHandle<()>>,
@@ -138,6 +140,7 @@ impl Daemon {
             session,
             clients: HashMap::new(),
             rechecked: HashSet::new(),
+            checks: HashMap::new(),
             control_task: None,
             lan_task: None,
             upnp_ssdp: None,
@@ -206,30 +209,29 @@ impl Daemon {
                 // A record that is not applied yet belongs to an add or to
                 // reconcile, and both recover it themselves with the right
                 // intent. Stepping in here would race them.
-                let applied =
+                let finalized =
                     self.metadata.read().get(&info_hash).is_some_and(|e| e.finalized);
-                if applied {
+                if finalized {
                     commands::recover_errored(self, &info_hash, commands::Finalize::Restore).await;
                 }
             }
-            DaemonEvent::CheckFinished { info_hash, from, repause } => {
-                commands::finalize_torrent(self, &info_hash, from).await;
+            DaemonEvent::CheckFinished { info_hash } => {
+                let Some(pending) = self.checks.remove(&info_hash) else { return };
+                commands::finalize_torrent(self, &info_hash, pending.from).await;
                 session_store::sync_bitfield(&self.data_dir, &info_hash);
-                if repause
+                if pending.repause
                     && let Err(e) = self.session.pause(&info_hash).await
                 {
                     warn!(hash = %short(&info_hash), error = %e, "restoring pause after check failed");
                 }
             }
             DaemonEvent::SelectForStream { info_hash, index, reply } => {
-                let result = commands::select_for_resume(
-                    &self.session,
-                    &self.metadata,
-                    &self.metadata_path,
-                    &info_hash,
-                    &[index],
-                )
-                .await;
+                let result =
+                    commands::select_for_resume(&self.session, &self.metadata, &info_hash, &[index])
+                        .await;
+                if result.is_ok() {
+                    let _ = self.save_metadata();
+                }
                 let _ = reply.send(result);
             }
             DaemonEvent::RestartRequested => {
@@ -250,6 +252,17 @@ impl Daemon {
     /// listeners) keep using the inbox events.
     pub(crate) fn request_shutdown(&mut self, kind: ShutdownKind) {
         self.shutdown_kind = Some(kind);
+    }
+
+    /// Publish the metadata store, logging a failure. It is the only record of
+    /// what the user asked to keep, and `removal::disposable` reads those flags,
+    /// so callers that answer a client pass the error on.
+    pub fn save_metadata(&self) -> Result<()> {
+        let result = self.metadata.read().save(&self.metadata_path);
+        if let Err(e) = &result {
+            warn!(error = %e, "failed to save metadata");
+        }
+        result
     }
 
     /// Fan an event out to every client without blocking the event loop. Uses
@@ -304,9 +317,7 @@ impl Daemon {
                 magneto_core::supervisor::remove_descriptor(&self.data_dir);
             }
         }
-        if let Err(e) = self.metadata.read().save(&self.metadata_path) {
-            warn!(error = %e, "failed to save metadata on shutdown");
-        }
+        let _ = self.save_metadata();
         self.cancel.cancel();
         self.clients.clear();
         let joins: Vec<JoinHandle<()>> = [

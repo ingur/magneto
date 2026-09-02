@@ -8,13 +8,14 @@ manages it automatically. Logs go to `{data_dir}/magneto.log`.
 
 | Module | Owns |
 |---|---|
-| `bootstrap` | startup: single-instance lock, config fallback, cleanup |
+| `bootstrap` | startup: single-instance lock, config fallback, reconcile |
 | `control` | WebSocket listener, token auth, client connections |
 | `commands` | request dispatch and the torrent operations |
 | `session` | the librqbit engine handle |
 | `stream` | HTTP range streaming to players |
 | `lan` + `upnp` | DLNA serving and discovery |
 | `stats` | per-second state deltas broadcast to clients |
-| `fastresume` | engine session persistence |
-| `watcher` | magnet metadata resolution timeouts |
+| `session_store` | engine session directory: repair and fastresume |
+| `check` | waits for a torrent's file check to finish |
+| `removal` | the one place a torrent or its bytes are deleted |
 | `metadata` | per-file flags and media classification |

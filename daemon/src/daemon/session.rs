@@ -52,6 +52,8 @@ impl SessionHandle {
             // Each open file stream holds one blocking permit for its whole life
             // and the same pool does disk writes, so the default 8 starves.
             runtime_worker_threads: Some(32),
+            // LSD announces on the LAN unasked, and magneto has its own
+            // discovery on the lan port.
             disable_local_service_discovery: true,
             // Keep the routing table in our data dir, not in a cache dir shared
             // with every other rqbit-based process.
@@ -123,8 +125,14 @@ impl SessionHandle {
         }
     }
 
+    /// The engine lets a pause interrupt a file check, which leaves the torrent
+    /// checking with no check running and only a restart to get it back, so
+    /// refuse it here.
     pub async fn pause(&self, info_hash: &str) -> Result<()> {
         let handle = self.require(info_hash)?;
+        if matches!(handle.stats().state, TorrentStatsState::Initializing { .. }) {
+            bail!("torrent is checking files");
+        }
         self.inner.pause(&handle).await
     }
 
