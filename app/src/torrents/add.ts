@@ -4,12 +4,26 @@
 // no-media / fallback toast comes from the event bridge (App.svelte); the add
 // only toasts the synchronous outcomes (already-existed, request error).
 
+import { SvelteSet } from "svelte/reactivity";
+
 import { ADD_REQUEST_TIMEOUT, daemon } from "@/daemon/client.svelte";
 import type { AddTorrentResp } from "@/daemon/protocol";
 import { pickTorrentFiles, readClipboardText, readTorrentFile } from "@/daemon/tauri";
 import { toast } from "@/lib/feedback/toasts/toasts.svelte";
 
 const SOURCE_RE = /^(magnet:|https?:\/\/)/i;
+const BTIH_RE = /xt=urn:btih:([0-9a-z]+)/i;
+
+/** Adds the daemon has not answered yet. A magnet resolves over the network, so
+ *  this is what the status bar reads and what refuses a duplicate add. */
+export const adding = new SvelteSet<string>();
+
+/** The info hash when the source carries one: two magnets for one torrent can
+ *  differ in trackers or display name. Trimmed as the daemon trims it. */
+function addKey(source: string): string {
+  const trimmed = source.trim();
+  return trimmed.match(BTIH_RE)?.[1].toLowerCase() ?? trimmed;
+}
 
 /** A pasteable add source: a magnet URI or an HTTP(S) torrent URL. */
 export function isAddSource(text: string): boolean {
@@ -31,10 +45,28 @@ export function addFailureHandled(message: string): boolean {
   return message !== "daemon not connected" && message !== "connection closed";
 }
 
+/** Keep the first of each torrent in a batch. Adds run one at a time, so the
+ *  in-flight guard is already clear by the time a duplicate starts. */
+export function dedupeSources(sources: string[]): string[] {
+  const seen = new Set<string>();
+  return sources.filter((source) => {
+    const key = addKey(source);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 /** Send one add. True once the daemon has taken the source (added, or already
  *  known); false when the request itself failed, so a queued source can be
  *  retried rather than lost. */
 export async function runAddSource(source: string): Promise<boolean> {
+  const key = addKey(source);
+  if (adding.has(key)) {
+    toast.info("Already adding that torrent");
+    return true;
+  }
+  adding.add(key);
   try {
     const resp = await daemon.request<AddTorrentResp>(
       "add_torrent",
@@ -46,6 +78,8 @@ export async function runAddSource(source: string): Promise<boolean> {
   } catch (e) {
     toast.error(addError(e));
     return addFailureHandled(e instanceof Error ? e.message : String(e));
+  } finally {
+    adding.delete(key);
   }
 }
 

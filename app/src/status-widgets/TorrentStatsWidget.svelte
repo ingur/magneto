@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { daemon } from "@/daemon/client.svelte";
+  import { adding } from "@/torrents/add";
   import { nav } from "@/torrents/nav.svelte";
   import StatusItem from "@/lib/status/StatusItem.svelte";
 
@@ -14,10 +14,7 @@
     if (rows.every((r) => r.kind === "file")) return "files";
     return "items";
   });
-  // Activity counts are live claims: hidden while the socket is down rather
-  // than frozen at their last reading. Stalled is downloading that receives
-  // nothing, so it counts.
-  const live = $derived(daemon.status === "connected");
+  // Stalled is downloading that receives nothing, so it counts.
   const downloading = $derived(
     rows.filter((r) => r.state === "downloading" || r.state === "stalled").length,
   );
@@ -47,4 +44,7 @@
   {#if seeding > 0}
     <StatusItem priority={30} class="text-success">↑ {seeding} seeding</StatusItem>
   {/if}
+{/if}
+{#if adding.size > 0}
+  <StatusItem priority={30} class="text-info">{adding.size} resolving</StatusItem>
 {/if}

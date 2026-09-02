@@ -10,7 +10,7 @@
 
 import { daemon } from "@/daemon/client.svelte";
 import { onSourcesReady, requeueSources, takePendingSources } from "@/daemon/tauri";
-import { isAddSource, runAddPath, runAddSource } from "./add";
+import { dedupeSources, isAddSource, runAddPath, runAddSource } from "./add";
 
 /** Start draining host-queued sources. Returns the unsubscriber. */
 export function initIntake(): () => void {
@@ -28,7 +28,7 @@ async function drain(): Promise<void> {
   if (daemon.status !== "connected") return;
   const sources = await takePendingSources();
   const failed: string[] = [];
-  for (const source of sources) {
+  for (const source of dedupeSources(sources)) {
     const ok = await (isAddSource(source) ? runAddSource(source) : runAddPath(source));
     if (!ok) failed.push(source);
   }
