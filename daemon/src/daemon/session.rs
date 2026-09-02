@@ -1,17 +1,25 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use librqbit::api::TorrentIdOrHash;
+use librqbit::dht::DhtPersistenceConfig;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, SessionOptions,
-    SessionPersistenceConfig,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ManagedTorrent, Session,
+    SessionOptions, SessionPersistenceConfig, TorrentStatsState,
 };
 use tokio::io::{AsyncRead, AsyncSeek};
 use tokio_util::bytes::Bytes;
+use tokio_util::sync::CancellationToken;
 
 pub type TorrentHandle = Arc<ManagedTorrent>;
+
+/// A persisted torrent whose `.torrent` sidecar is unreadable falls back to a
+/// magnet, and librqbit resolves it inside session construction with no bound of
+/// its own. Unbounded, that means the control port never binds.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct SessionHandle {
     inner: Arc<Session>,
@@ -32,15 +40,39 @@ pub struct OpenStream {
 }
 
 impl SessionHandle {
-    pub async fn new(downloads_dir: PathBuf, session_dir: PathBuf) -> Result<Self> {
+    pub async fn new(
+        downloads_dir: PathBuf,
+        session_dir: PathBuf,
+        dht_state: PathBuf,
+        cancel: CancellationToken,
+    ) -> Result<Self> {
         let opts = SessionOptions {
             persistence: Some(SessionPersistenceConfig::Json { folder: Some(session_dir) }),
             fastresume: true,
+            // Each open file stream holds one blocking permit for its whole life
+            // and the same pool does disk writes, so the default 8 starves.
+            runtime_worker_threads: Some(32),
+            disable_local_service_discovery: true,
+            // Keep the routing table in our data dir, not in a cache dir shared
+            // with every other rqbit-based process.
+            dht: Some(DhtSessionConfig {
+                persistence: Some(DhtPersistenceConfig {
+                    config_filename: Some(dht_state),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            cancellation_token: Some(cancel.clone()),
             ..Default::default()
         };
-        let inner = Session::new_with_opts(downloads_dir, opts)
-            .await
-            .context("constructing librqbit session")?;
+        let open = Session::new_with_opts(downloads_dir, opts);
+        let inner = match tokio::time::timeout(OPEN_TIMEOUT, open).await {
+            Ok(session) => session.context("constructing librqbit session")?,
+            Err(_) => {
+                cancel.cancel();
+                bail!("librqbit session did not open within {}s", OPEN_TIMEOUT.as_secs());
+            }
+        };
         Ok(Self { inner })
     }
 
@@ -101,15 +133,13 @@ impl SessionHandle {
         self.inner.unpause(&handle).await
     }
 
-    /// Unpause only if the torrent is paused. librqbit's `unpause` hard-errors
-    /// "torrent is already live" on a running torrent, so callers that just want
-    /// to ensure it is live route through here.
+    /// Unpause only when the engine is holding the torrent still: paused, or
+    /// checking files with a pause pending (which `pause` leaves behind and
+    /// only a fresh start clears). librqbit's `unpause` hard-errors on a live
+    /// torrent, and an unpause landing mid-check strands it.
     pub async fn unpause_if_paused(&self, info_hash: &str) -> Result<()> {
         let handle = self.require(info_hash)?;
-        if !handle.is_paused() {
-            return Ok(());
-        }
-        self.inner.unpause(&handle).await
+        self.ensure_active(&handle).await
     }
 
     pub async fn update_only_files(
@@ -122,15 +152,6 @@ impl SessionHandle {
     }
 
     pub async fn delete(&self, info_hash: &str, delete_files: bool) -> Result<()> {
-        // librqbit's delete unwraps the torrent metadata (`load_full().expect`),
-        // so deleting an in-session torrent whose metadata isn't resolved (e.g. a
-        // persisted magnet still re-resolving just after a restart, see the
-        // reconcile watcher path) would panic the whole daemon on the event loop.
-        // Refuse cleanly instead; it becomes deletable once metadata resolves.
-        let handle = self.require(info_hash)?;
-        if handle.with_metadata(|_| ()).is_err() {
-            bail!("torrent is still resolving and cannot be removed yet");
-        }
         let id = TorrentIdOrHash::parse(info_hash).context("invalid info_hash")?;
         self.inner.delete(id, delete_files).await
     }
@@ -141,13 +162,13 @@ impl SessionHandle {
     pub async fn stream(&self, info_hash: &str, file_index: usize) -> Result<OpenStream> {
         let handle = self.require(info_hash)?;
         self.ensure_active(&handle).await?;
-        let stream = handle.stream(file_index).context("opening file stream")?;
+        let stream = handle.stream(file_index).await.context("opening file stream")?;
         let length = stream.len();
         Ok(OpenStream { reader: Box::new(stream), length })
     }
 
     async fn ensure_active(&self, handle: &TorrentHandle) -> Result<()> {
-        if !handle.is_paused() {
+        if !engine_paused(&handle.stats().state) {
             return Ok(());
         }
         self.inner.unpause(handle).await
@@ -157,4 +178,11 @@ impl SessionHandle {
         self.get(info_hash)
             .with_context(|| format!("no torrent with info_hash {info_hash}"))
     }
+}
+
+/// Whether the engine is holding this torrent still. `ManagedTorrent::is_paused`
+/// reports the persisted intent instead, which drifts from the state machine
+/// when a pause or unpause lands while files are being checked.
+pub fn engine_paused(state: &TorrentStatsState) -> bool {
+    matches!(state, TorrentStatsState::Paused | TorrentStatsState::Initializing { paused: true })
 }

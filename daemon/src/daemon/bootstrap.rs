@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::warn;
 
 use magneto_core::config::Config;
 use crate::daemon::{
@@ -40,31 +40,48 @@ pub async fn run(config_path: PathBuf, data_dir: PathBuf, metadata_path: PathBuf
         }
     };
 
-    // Installed once, above the candidate loop, so a failed attempt never orphans
-    // signal listeners.
+    // Installed once, above the config choice, so a failed attempt never
+    // orphans signal listeners.
     let (inbox_tx, inbox_rx) = mpsc::channel(256);
     let cancel = CancellationToken::new();
     install_shutdown_listeners(inbox_tx.clone());
 
-    let mut last_err: Option<anyhow::Error> = None;
-    for (idx, started) in candidate_configs(&desired, &data_dir).into_iter().enumerate() {
-        if idx > 0 {
-            warn!("primary config failed to start; falling back to last-known-good");
-        }
-        match start_once(&desired, started, &config_path, &data_dir, &metadata_path, &inbox_tx, &cancel)
-            .await
-        {
-            Ok(daemon) => return daemon.run(inbox_rx).await,
+    // Only the config-dependent checks get a second candidate. Everything past
+    // them owns the session directory, and two engines over one session
+    // directory corrupt it.
+    let mut started = None;
+    let mut last_err = None;
+    for (idx, candidate) in candidate_configs(&desired, &data_dir).into_iter().enumerate() {
+        match preflight_config(&candidate) {
+            Ok(()) => {
+                started = Some(candidate);
+                break;
+            }
             Err(e) => {
-                warn!(error = %e, "daemon start attempt failed");
+                if idx == 0 {
+                    warn!(error = %e, "primary config unusable; trying last-known-good");
+                }
                 last_err = Some(e);
             }
         }
     }
+    let started = match started {
+        Some(config) => config,
+        None => return Err(last_err.unwrap_or_else(|| anyhow!("daemon failed to start"))),
+    };
 
-    // No candidate started: drop the marker so it can't suppress cleanup next time.
-    let _ = std::fs::remove_file(crate::daemon::restart_marker_path(&data_dir));
-    Err(last_err.unwrap_or_else(|| anyhow!("daemon failed to start")))
+    let daemon = start_once(&desired, started, &config_path, &data_dir, &metadata_path, &inbox_tx, &cancel)
+        .await?;
+    daemon.run(inbox_rx).await
+}
+
+/// The checks that depend on the config: a contested port or an unwritable
+/// downloads dir means this candidate cannot run.
+fn preflight_config(config: &Config) -> Result<()> {
+    preflight::probe_bind([127, 0, 0, 1], config.network.control_port)
+        .with_context(|| format!("control port {} unavailable", config.network.control_port))?;
+    preflight::probe_dir(&config.downloads.dir)
+        .with_context(|| format!("downloads dir {} not writable", config.downloads.dir.display()))
 }
 
 async fn start_once(
@@ -76,13 +93,6 @@ async fn start_once(
     inbox_tx: &mpsc::Sender<DaemonEvent>,
     cancel: &CancellationToken,
 ) -> Result<Daemon> {
-    // Probe before constructing, so a doomed config never builds a session or
-    // touches persistent state.
-    preflight::probe_bind([127, 0, 0, 1], started.network.control_port)
-        .with_context(|| format!("control port {} unavailable", started.network.control_port))?;
-    preflight::probe_dir(&started.downloads.dir)
-        .with_context(|| format!("downloads dir {} not writable", started.downloads.dir.display()))?;
-
     let mut daemon = Daemon::new(
         desired.clone(),
         started.clone(),
@@ -182,24 +192,7 @@ fn generate_token() -> String {
 
 /// All persistent side effects happen here, once, after a fully successful start.
 async fn commit(daemon: &mut Daemon, started: &Config, control_token: &str) {
-    let marker = crate::daemon::restart_marker_path(&daemon.data_dir);
-    let had_marker = marker.exists();
     commands::reconcile(daemon).await;
-    // Skip destructive cleanup when restarting (in-flight unpersisted downloads
-    // must survive) OR when metadata was just recovered fresh (the persisted
-    // flags cleanup relies on were lost, so it would delete everything).
-    if had_marker || daemon.metadata_recovered {
-        let reason = if had_marker { "restart marker present" } else { "metadata recovered fresh" };
-        info!(reason, "startup cleanup skipped");
-    } else {
-        let cleanup = commands::cleanup_unpersisted(daemon);
-        if tokio::time::timeout(Duration::from_secs(10), cleanup).await.is_err() {
-            warn!("startup cleanup_unpersisted timed out after 10s; proceeding");
-        } else {
-            info!("startup cleanup complete");
-        }
-    }
-    let _ = std::fs::remove_file(&marker);
     if let Err(e) = supervisor::write_descriptor(
         &daemon.data_dir,
         started.network.control_port,

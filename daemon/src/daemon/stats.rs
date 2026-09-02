@@ -73,16 +73,18 @@ pub fn spawn(
             // Clone the latest config each tick so a hot-applied set_config (media
             // extensions, persist/share defaults) is reflected without a restart.
             let config = config_rx.borrow().clone();
-            let (completes, event) = build_tick(&session, &metadata, &config, &mut last_sent);
-            for hash in completes {
-                if inbox
-                    .send(DaemonEvent::TorrentCompletedTick { info_hash: hash })
-                    .await
-                    .is_err()
-                {
+            let tick = build_tick(&session, &metadata, &config, &mut last_sent);
+            for info_hash in tick.completed {
+                if inbox.send(DaemonEvent::TorrentCompletedTick { info_hash }).await.is_err() {
                     return;
                 }
             }
+            for info_hash in tick.errored {
+                if inbox.send(DaemonEvent::TorrentErrored { info_hash }).await.is_err() {
+                    return;
+                }
+            }
+            let event = tick.event;
             if !event.is_empty()
                 && inbox.send(DaemonEvent::StatsReady(event)).await.is_err()
             {
@@ -92,13 +94,22 @@ pub fn spawn(
     })
 }
 
+/// What one tick produced: the torrents that just finished, the ones the engine
+/// just put in the error state, and the deltas for every client.
+struct Tick {
+    completed: Vec<String>,
+    errored: Vec<String>,
+    event: StatsEvent,
+}
+
 fn build_tick(
     session: &Arc<SessionHandle>,
     metadata: &Arc<RwLock<MetadataStore>>,
     config: &Config,
     last_sent: &mut HashMap<String, LastSent>,
-) -> (Vec<String>, StatsEvent) {
-    let mut completes = Vec::new();
+) -> Tick {
+    let mut completed = Vec::new();
+    let mut errored = Vec::new();
     let mut event = StatsEvent::default();
     let infohashes = session.list_infohashes();
     let meta = metadata.read();
@@ -154,9 +165,15 @@ fn build_tick(
         // the UI treats state as latest-wins, so the duplicate is harmless.
         let was_downloading =
             last.map(|l| l.state == TorrentState::Downloading).unwrap_or(false);
-        let now_complete = summary.state == TorrentState::Complete;
-        if now_complete && was_downloading {
-            completes.push(hash.clone());
+        if summary.state == TorrentState::Complete && was_downloading {
+            completed.push(hash.clone());
+        }
+        // A torrent found in error needs a re-check, whether it errored just now
+        // or was already errored when this daemon started.
+        if summary.state == TorrentState::Error
+            && last.map(|l| l.state != TorrentState::Error).unwrap_or(true)
+        {
+            errored.push(hash.clone());
         }
 
         let total_bytes_selected = summary.total_bytes_selected;
@@ -300,5 +317,5 @@ fn build_tick(
     let still_alive: std::collections::HashSet<&String> = infohashes.iter().collect();
     last_sent.retain(|hash, _| still_alive.contains(hash));
 
-    (completes, event)
+    Tick { completed, errored, event }
 }

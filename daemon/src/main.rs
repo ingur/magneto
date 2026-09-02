@@ -27,6 +27,13 @@ async fn run() -> Result<()> {
     #[cfg(feature = "deadlock-detection")]
     spawn_deadlock_checker();
 
+    // The engine holds one descriptor per file of every torrent for as long as
+    // it is loaded, so a soft limit of 1024 runs out on a library of packs.
+    match librqbit::try_increase_nofile_limit() {
+        Ok(limit) => tracing::debug!(limit, "file descriptor limit"),
+        Err(e) => tracing::warn!(error = %e, "could not raise the file descriptor limit"),
+    }
+
     let kind = bootstrap::run(config_path, data_dir, metadata_path).await?;
     tracing::info!(?kind, "daemon exited");
     Ok(())

@@ -35,11 +35,6 @@ in
     enable = true;
     channel = "stable";
     targets = [ "x86_64-pc-windows-gnu" ];
-    # The tray's libappindicator is dlopen'd at runtime, not linked, so the
-    # cc-wrapper rpaths don't cover it. Without this rpath the app only starts
-    # where LD_LIBRARY_PATH is set (inside this shell); a handler launch from
-    # a browser or file manager panics before single-instance can forward.
-    rustflags = "-C link-arg=-Wl,-rpath,${lib.makeLibraryPath [ pkgs.libayatana-appindicator ]}";
   };
 
   languages.javascript = {
@@ -68,9 +63,25 @@ in
     pkgs.openssl
   ];
 
+  # win.stdenv.cc exports itself as CC/CXX/AR, which breaks host C builds
+  # (librqbit pulls aws-lc-sys).
+  env.CC_x86_64_unknown_linux_gnu = "gcc";
+  env.CXX_x86_64_unknown_linux_gnu = "g++";
+  env.AR_x86_64_unknown_linux_gnu = "ar";
+
+  # libappindicator is dlopen'd by the tray at runtime, so the cc-wrapper
+  # rpaths don't cover it: without this the app only starts where
+  # LD_LIBRARY_PATH is set (inside this shell), and a handler launch from a
+  # browser or file manager panics before single-instance can forward.
+  # Per-target, because a global RUSTFLAGS silences the Windows flags below.
+  env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS =
+    "-C link-arg=-Wl,-rpath,${lib.makeLibraryPath [ pkgs.libayatana-appindicator ]}";
+
   env.CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = winCC;
   env.CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-L native=${win.windows.pthreads}/lib";
   env.CC_x86_64_pc_windows_gnu = winCC;
+  # aws-lc-sys compiles jitterentropy, which needs winpthreads' sched.h.
+  env.CFLAGS_x86_64_pc_windows_gnu = "-I${win.windows.pthreads}/include";
   env.AR_x86_64_pc_windows_gnu = winAR;
   env.X86_64_PC_WINDOWS_GNU_OPENSSL_LIB_DIR = "${win.openssl.out}/lib";
   env.X86_64_PC_WINDOWS_GNU_OPENSSL_INCLUDE_DIR = "${win.openssl.dev}/include";

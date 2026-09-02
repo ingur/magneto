@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,16 +15,17 @@ use crate::metadata::MetadataStore;
 use magneto_core::protocol::{DaemonInfo, Outbound, Request, SnapshotEvent};
 
 pub mod bootstrap;
+pub mod check;
 pub mod commands;
 pub mod control;
-pub mod fastresume;
 pub mod lan;
 pub mod preflight;
+pub mod removal;
 pub mod session;
+pub mod session_store;
 pub mod stats;
 pub mod stream;
 pub mod upnp;
-pub mod watcher;
 
 use session::SessionHandle;
 
@@ -42,8 +43,11 @@ pub enum DaemonEvent {
     ClientMessage { id: ClientId, text: String },
     StatsReady(magneto_core::protocol::StatsEvent),
     TorrentCompletedTick { info_hash: String },
-    MetadataResolved { info_hash: String },
-    MetadataFailed { info_hash: String, error: String },
+    // A torrent the engine put in the error state, seen by the stats tick.
+    TorrentErrored { info_hash: String },
+    // A torrent finished checking its files, so the engine side of finalizing
+    // can run now.
+    CheckFinished { info_hash: String, from: commands::Finalize, repause: bool },
     // A spawned add_torrent finished (or timed out); carries everything needed
     // to finalize the torrent and answer the requesting client.
     AddCompleted {
@@ -76,12 +80,10 @@ pub struct Daemon {
     pub metadata: Arc<RwLock<MetadataStore>>,
     pub metadata_path: PathBuf,
     pub session: Arc<SessionHandle>,
-    // True when metadata.json was unparseable at load and a fresh store replaced
-    // it. Startup cleanup keys off per-file persisted flags the fresh store no
-    // longer has, so it must be skipped this boot (like the restart marker).
-    pub metadata_recovered: bool,
     pub clients: HashMap<ClientId, ClientHandle>,
-    pub watchers: HashMap<String, JoinHandle<()>>,
+    // Torrents already re-checked after an engine error this run, so a failing
+    // check cannot loop.
+    pub rechecked: HashSet<String>,
     pub control_task: Option<JoinHandle<()>>,
     pub lan_task: Option<JoinHandle<()>>,
     pub upnp_ssdp: Option<JoinHandle<()>>,
@@ -109,11 +111,20 @@ impl Daemon {
         cancel: CancellationToken,
     ) -> Result<Self> {
         started.ensure_dirs().context("ensuring downloads dir")?;
-        let (metadata_store, metadata_recovered) = MetadataStore::load_or_create(&metadata_path)?;
-        let metadata = Arc::new(RwLock::new(metadata_store));
+        let metadata = Arc::new(RwLock::new(MetadataStore::load_or_create(&metadata_path)?));
 
-        let session_dir = fastresume::session_dir(&data_dir);
-        let session = Arc::new(SessionHandle::new(started.downloads.dir.clone(), session_dir).await?);
+        // Before the engine opens the session: it restores torrents from the
+        // files in there and stalls the whole boot on anything unreadable.
+        session_store::repair(&data_dir);
+        let session = Arc::new(
+            SessionHandle::new(
+                started.downloads.dir.clone(),
+                session_store::session_dir(&data_dir),
+                data_dir.join("dht.json"),
+                cancel.clone(),
+            )
+            .await?,
+        );
 
         let (config_tx, _) = watch::channel(config.clone());
 
@@ -125,9 +136,8 @@ impl Daemon {
             metadata,
             metadata_path,
             session,
-            metadata_recovered,
             clients: HashMap::new(),
-            watchers: HashMap::new(),
+            rechecked: HashSet::new(),
             control_task: None,
             lan_task: None,
             upnp_ssdp: None,
@@ -192,14 +202,24 @@ impl Daemon {
                 let resp = commands::finish_add(self, request_id, source, kind, outcome).await;
                 self.send_to(client, resp);
             }
-            DaemonEvent::MetadataResolved { info_hash } => {
-                self.watchers.remove(&info_hash);
-                commands::finalize_torrent(self, &info_hash).await;
+            DaemonEvent::TorrentErrored { info_hash } => {
+                // A record that is not applied yet belongs to an add or to
+                // reconcile, and both recover it themselves with the right
+                // intent. Stepping in here would race them.
+                let applied =
+                    self.metadata.read().get(&info_hash).is_some_and(|e| e.finalized);
+                if applied {
+                    commands::recover_errored(self, &info_hash, commands::Finalize::Restore).await;
+                }
             }
-            DaemonEvent::MetadataFailed { info_hash, error } => {
-                self.watchers.remove(&info_hash);
-                warn!(hash = %short(&info_hash), error = %error, "metadata resolution failed");
-                self.broadcast(Outbound::TorrentError { info_hash, error });
+            DaemonEvent::CheckFinished { info_hash, from, repause } => {
+                commands::finalize_torrent(self, &info_hash, from).await;
+                session_store::sync_bitfield(&self.data_dir, &info_hash);
+                if repause
+                    && let Err(e) = self.session.pause(&info_hash).await
+                {
+                    warn!(hash = %short(&info_hash), error = %e, "restoring pause after check failed");
+                }
             }
             DaemonEvent::SelectForStream { info_hash, index, reply } => {
                 let result = commands::select_for_resume(
@@ -271,19 +291,15 @@ impl Daemon {
 
     async fn teardown(&mut self, kind: ShutdownKind) {
         match kind {
-            ShutdownKind::Restart => {
-                self.broadcast(Outbound::DaemonRestarting);
-                // Tells the next startup to skip cleanup so in-flight unpersisted
-                // downloads survive the restart.
-                if let Err(e) = std::fs::write(restart_marker_path(&self.data_dir), b"") {
-                    warn!(error = %e, "failed to write restart marker");
-                }
-            }
+            ShutdownKind::Restart => self.broadcast(Outbound::DaemonRestarting),
             ShutdownKind::Stop => {
                 self.broadcast(Outbound::DaemonShutdown);
+                // Only a deliberate stop drops what the user did not keep. A
+                // crash leaves everything in place: the next boot cannot tell
+                // the difference, so it must not delete on the guess.
                 let cleanup = commands::cleanup_unpersisted(self);
                 if tokio::time::timeout(Duration::from_secs(10), cleanup).await.is_err() {
-                    warn!("cleanup_unpersisted timed out after 10s; proceeding with shutdown");
+                    warn!("cleanup timed out after 10s; the next stop finishes it");
                 }
                 magneto_core::supervisor::remove_descriptor(&self.data_dir);
             }
@@ -293,9 +309,6 @@ impl Daemon {
         }
         self.cancel.cancel();
         self.clients.clear();
-        for (_, handle) in self.watchers.drain() {
-            handle.abort();
-        }
         let joins: Vec<JoinHandle<()>> = [
             self.control_task.take(),
             self.stats_task.take(),
@@ -314,13 +327,6 @@ impl Daemon {
 
 pub fn short(info_hash: &str) -> &str {
     info_hash.get(..8).unwrap_or(info_hash)
-}
-
-/// Marker that tells the next startup a restart is in progress, so cleanup of
-/// in-flight unpersisted downloads is skipped. Written on restart teardown,
-/// removed once consumed.
-pub(crate) fn restart_marker_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(".restarting")
 }
 
 pub(crate) fn install_shutdown_listeners(inbox: mpsc::Sender<DaemonEvent>) {

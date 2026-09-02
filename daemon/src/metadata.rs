@@ -22,6 +22,15 @@ pub struct TorrentMetadata {
     pub source_kind: SourceKind,
     pub added_at: DateTime<Utc>,
     pub files: BTreeMap<u32, FileMetadata>,
+    // False from the add until the file check finishes, while `files` is still
+    // empty. Cleanup must read that as unknown, not as "nothing persisted".
+    #[serde(default = "default_finalized")]
+    pub finalized: bool,
+}
+
+// Entries written before this field existed had already been finalized.
+fn default_finalized() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -36,58 +45,36 @@ pub struct FileMetadata {
 }
 
 impl MetadataStore {
-    /// Load the store, returning `(store, recovered)`. `recovered` is true when
-    /// the file existed but could not be parsed and a fresh store was started in
-    /// its place. The caller must then skip destructive cleanup (which keys off
-    /// per-file `persisted` flags that the fresh store no longer has).
-    pub fn load_or_create(path: &Path) -> Result<(Self, bool)> {
-        if !path.exists() {
-            let store = Self::default();
-            store.save(path)?;
-            return Ok((store, false));
-        }
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+    /// Load the store, replacing an unreadable one with a fresh store and a
+    /// `.bak` copy of what was there. Callers cannot tell the two apart on
+    /// purpose: a store with no entry for a torrent says nothing about it, and
+    /// nothing may be deleted on that basis.
+    pub fn load_or_create(path: &Path) -> Result<Self> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let store = Self::default();
+                store.save(path)?;
+                return Ok(store);
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
         match serde_json::from_str::<Self>(&text) {
-            Ok(store) => Ok((store, false)),
+            Ok(store) => Ok(store),
             Err(e) => {
                 let backup = path.with_extension("json.bak");
                 warn!(error = %e, backup = %backup.display(), "metadata.json unparseable; backing up and starting fresh");
                 let _ = std::fs::rename(path, &backup);
                 let store = Self::default();
                 store.save(path)?;
-                Ok((store, true))
+                Ok(store)
             }
         }
     }
-
     pub fn save(&self, path: &Path) -> Result<()> {
-        let parent = path.parent();
-        if let Some(parent) = parent {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let tmp = path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(self).context("serializing metadata")?;
-        // Write + fsync the temp file so its bytes are durable before the rename
-        // publishes it: a torn write must never replace good metadata, since a
-        // fresh-parsed store would drive cleanup to delete persisted downloads.
-        {
-            let mut f = std::fs::File::create(&tmp)
-                .with_context(|| format!("creating {}", tmp.display()))?;
-            f.write_all(text.as_bytes())
-                .with_context(|| format!("writing {}", tmp.display()))?;
-            f.sync_all().with_context(|| format!("syncing {}", tmp.display()))?;
-        }
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-        // fsync the directory so the rename itself survives a crash.
-        if let Some(parent) = parent
-            && let Ok(dir) = std::fs::File::open(parent)
-        {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+        write_durable(path, text.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn get(&self, info_hash: &str) -> Option<&TorrentMetadata> {
@@ -120,11 +107,33 @@ pub fn torrent_file_path(data_dir: &Path, info_hash: &str) -> PathBuf {
 }
 
 pub fn save_torrent_bytes(data_dir: &Path, info_hash: &str, bytes: &[u8]) -> Result<PathBuf> {
-    let dir = torrents_dir(data_dir);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let path = dir.join(format!("{info_hash}.torrent"));
-    std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    let path = torrent_file_path(data_dir, info_hash);
+    write_durable(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
+}
+
+/// Publish bytes so a crash leaves either the old file or the new one: write a
+/// temp file, fsync it, rename, then fsync the directory. Both metadata.json and
+/// the saved `.torrent` copies are recovery authority, so a torn write of either
+/// costs the user data.
+pub fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent();
+    if let Some(parent) = parent {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = parent
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 pub fn delete_torrent_bytes(data_dir: &Path, info_hash: &str) {
@@ -153,6 +162,7 @@ mod tests {
                 source_kind: SourceKind::Magnet,
                 added_at: chrono::Utc::now(),
                 files,
+                finalized: true,
             },
         );
 
@@ -189,44 +199,48 @@ mod tests {
                 source_kind: SourceKind::Magnet,
                 added_at: chrono::Utc::now(),
                 files,
+                finalized: true,
             },
         );
         store
     }
 
     #[test]
-    fn save_then_load_round_trips_durably_without_recovery() {
+    fn save_then_load_round_trips_durably() {
         let dir = temp_dir("roundtrip");
         let path = dir.join("metadata.json");
         sample().save(&path).unwrap();
-        let (loaded, recovered) = MetadataStore::load_or_create(&path).unwrap();
-        assert!(!recovered);
+        let loaded = MetadataStore::load_or_create(&path).unwrap();
         assert!(loaded.torrents.values().next().unwrap().files.get(&0).unwrap().persisted);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn missing_file_creates_without_recovery() {
+    fn missing_file_creates_empty_store() {
         let dir = temp_dir("missing");
         let path = dir.join("metadata.json");
-        let (loaded, recovered) = MetadataStore::load_or_create(&path).unwrap();
-        assert!(!recovered);
+        let loaded = MetadataStore::load_or_create(&path).unwrap();
         assert!(loaded.torrents.is_empty());
         assert!(path.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn corrupt_file_recovers_fresh_and_backs_up() {
+    fn corrupt_file_starts_fresh_and_backs_up() {
         let dir = temp_dir("corrupt");
         let path = dir.join("metadata.json");
         sample().save(&path).unwrap();
         std::fs::write(&path, b"{ not valid json").unwrap();
-        let (loaded, recovered) = MetadataStore::load_or_create(&path).unwrap();
-        // `recovered` is the flag that makes startup skip destructive cleanup.
-        assert!(recovered);
+        let loaded = MetadataStore::load_or_create(&path).unwrap();
         assert!(loaded.torrents.is_empty());
         assert!(path.with_extension("json.bak").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn entry_without_finalized_field_reads_as_finalized() {
+        let json = r#"{"torrents":{"aa":{"source":"magnet:?xt=urn:btih:aa","source_kind":"magnet","added_at":"2024-01-01T00:00:00Z","files":{}}}}"#;
+        let store: MetadataStore = serde_json::from_str(json).unwrap();
+        assert!(store.get("aa").unwrap().finalized);
     }
 }
