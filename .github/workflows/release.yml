@@ -88,7 +88,7 @@ jobs:
           # aws-lc-sys (rustls, via librqbit) assembles with NASM on Windows
           # x86-64 and the runner image has none, so use the objects the crate
           # ships prebuilt. No effect on other platforms.
-          AWS_LC_SYS_PREBUILT_NASM: 1
+          AWS_LC_SYS_PREBUILT_NASM: "1"
         with:
           projectPath: app
           # Tag push: draft release carrying the bundles, named after the
